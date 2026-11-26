@@ -117,8 +117,9 @@ func Validate(schema Values, value any) error {
 	}
 	return s.Validate(instance)
 }
-func objectSchema(s Values) error {
-	if s["type"] != "object" || s["additionalProperties"] != false {
+func objectSchema(s Values, actionForm bool) error {
+	rootRef := actionForm && s["$ref"] != nil
+	if !rootRef && (s["type"] != "object" || s["additionalProperties"] != false) {
 		return errors.New("form schema must be a closed object")
 	}
 	c := js.NewCompiler()
@@ -130,8 +131,53 @@ func objectSchema(s Values) error {
 	if err = c.AddResource("form.json", bytes.NewReader(raw)); err != nil {
 		return err
 	}
-	_, err = c.Compile("form.json")
-	return err
+	compiled, err := c.Compile("form.json")
+	if err != nil || !rootRef {
+		return err
+	}
+	// Inspect the compiler's reference chain so draft-specific sibling rules
+	// stay identical to those enforced by Validate on the original schema.
+	seen := map[*js.Schema]bool{}
+	var closed []*js.Schema
+	object := false
+	properties := map[string]bool{}
+	for layer := compiled; layer != nil; layer = layer.Ref {
+		if seen[layer] {
+			return errors.New("cyclic form root reference")
+		}
+		seen[layer] = true
+		object = object || slices.Equal(layer.Types, []string{"object"})
+		if layer.AdditionalProperties == false {
+			closed = append(closed, layer)
+		}
+		for name := range layer.Properties {
+			properties[name] = true
+		}
+		for _, name := range layer.Required {
+			properties[name] = true
+		}
+	}
+	if !object || len(closed) == 0 {
+		return errors.New("referenced form must describe a closed object")
+	}
+	for _, layer := range closed {
+		for name := range properties {
+			if _, ok := layer.Properties[name]; ok {
+				continue
+			}
+			matched := false
+			for pattern := range layer.PatternProperties {
+				if pattern.MatchString(name) {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				return fmt.Errorf("form field %q is forbidden by additionalProperties at %s; declare fields and closure together", name, layer.Location)
+			}
+		}
+	}
+	return nil
 }
 func SafePath(name string) bool {
 	return name != "." && fs.ValidPath(name) && !strings.ContainsAny(name, `\:#?%`)
@@ -162,7 +208,7 @@ func (r Release) Inspect() (Tool, error) {
 		}
 		seen[a.ID] = true
 		if a.Input != nil {
-			if err := objectSchema(a.Input); err != nil {
+			if err := objectSchema(a.Input, true); err != nil {
 				return Tool{}, fmt.Errorf("%s: %w", a.ID, err)
 			}
 		}
@@ -176,7 +222,7 @@ func (r Release) Inspect() (Tool, error) {
 		if !SafePath(m.ConfigSchema) {
 			return Tool{}, errors.New("invalid schema path")
 		}
-		if err := objectSchema(r.Schema); err != nil {
+		if err := objectSchema(r.Schema, false); err != nil {
 			return Tool{}, err
 		}
 	} else if r.Schema != nil {

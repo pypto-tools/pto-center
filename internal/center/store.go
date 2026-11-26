@@ -46,6 +46,9 @@ func Open(dir string, key ed25519.PublicKey) (*Store, error) {
  CREATE TABLE IF NOT EXISTS bundles(digest TEXT PRIMARY KEY, tool TEXT NOT NULL, version TEXT NOT NULL, raw BLOB NOT NULL, meta BLOB NOT NULL, UNIQUE(tool,version));
  CREATE TABLE IF NOT EXISTS inventory(node TEXT NOT NULL,tool TEXT NOT NULL,raw BLOB NOT NULL,seen INTEGER NOT NULL,PRIMARY KEY(node,tool));
  CREATE TABLE IF NOT EXISTS config_baselines(node TEXT NOT NULL,tool TEXT NOT NULL,schema_version INTEGER NOT NULL,raw BLOB NOT NULL,PRIMARY KEY(node,tool,schema_version));
+ CREATE TABLE IF NOT EXISTS installed_versions(node TEXT NOT NULL,tool TEXT NOT NULL,version TEXT NOT NULL,PRIMARY KEY(node,tool));
+ INSERT OR IGNORE INTO installed_versions SELECT node,tool,json_extract(CAST(raw AS TEXT),'$.installedVersion') FROM inventory
+ WHERE json_extract(CAST(raw AS TEXT),'$.presence')='present' AND json_extract(CAST(raw AS TEXT),'$.installedVersion')<>'';
  INSERT OR IGNORE INTO config_baselines SELECT node,tool,json_extract(CAST(raw AS TEXT),'$.configSchemaVersion'),json_extract(CAST(raw AS TEXT),'$.config')
  FROM inventory WHERE json_extract(CAST(raw AS TEXT),'$.presence')='present' AND json_type(CAST(raw AS TEXT),'$.config')='object' AND json_extract(CAST(raw AS TEXT),'$.configSchemaVersion')>0;
  CREATE TABLE IF NOT EXISTS tasks(seq INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE,node TEXT NOT NULL,tool TEXT NOT NULL,action TEXT NOT NULL, digest TEXT NOT NULL,raw BLOB NOT NULL,state TEXT NOT NULL,result BLOB, actor TEXT NOT NULL,created INTEGER NOT NULL);
@@ -624,7 +627,11 @@ func coalescePending(tx *sql.Tx, t p.Task, largest p.Values) error {
 			}
 			if _, selected := t.Values[field]; selected {
 				if !retained[field] {
-					if !sameField(t.Expected, prev.Expected, field) {
+					expected, err := predecessorBaseline(tx, prev, field)
+					if err != nil {
+						return err
+					}
+					if !sameField(t.Expected, expected, field) {
 						return fmt.Errorf("%s: %s 有不同基线的待处理任务，请重新预览", t.Node, field)
 					}
 					if _, err := tx.Exec("INSERT INTO config_dependencies(task,field,predecessor) VALUES(?,?,?)", t.ID, field, prev.ID); err != nil {
@@ -642,6 +649,19 @@ func coalescePending(tx *sql.Tx, t p.Task, largest p.Values) error {
 		}
 	}
 	return nil
+}
+func predecessorBaseline(tx *sql.Tx, task p.Task, field string) (p.Values, error) {
+	var raw []byte
+	err := tx.QueryRow("SELECT confirmed FROM config_dependencies WHERE task=? AND field=?", task.ID, field).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) || err == nil && raw == nil {
+		return task.Expected, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var baseline p.Values
+	err = json.Unmarshal(raw, &baseline)
+	return baseline, err
 }
 func (s *Store) next(ctx context.Context, node string) (p.Task, error) {
 	var t p.Task
@@ -815,13 +835,19 @@ func (s *Store) finish(t p.Task, r p.Reply) error {
 
 func recordBaseline(tx *sql.Tx, t p.Task, o p.Inventory) error {
 	if o.Presence != "present" {
+		if _, err := tx.Exec("DELETE FROM installed_versions WHERE node=? AND tool=?", t.Node, t.Tool); err != nil {
+			return err
+		}
 		_, err := tx.Exec("DELETE FROM config_baselines WHERE node=? AND tool=?", t.Node, t.Tool)
 		return err
 	}
 	if o.Installed != "" {
-		_, err := tx.Exec(`DELETE FROM config_baselines WHERE node=? AND tool=? AND EXISTS(
-			SELECT 1 FROM inventory WHERE node=? AND tool=? AND json_extract(CAST(raw AS TEXT),'$.installedVersion')<>?)`, t.Node, t.Tool, t.Node, t.Tool, o.Installed)
+		_, err := tx.Exec(`DELETE FROM config_baselines WHERE node=? AND tool=? AND NOT EXISTS(
+			SELECT 1 FROM installed_versions WHERE node=? AND tool=? AND version=?)`, t.Node, t.Tool, t.Node, t.Tool, o.Installed)
 		if err != nil {
+			return err
+		}
+		if _, err = tx.Exec("INSERT OR REPLACE INTO installed_versions VALUES(?,?,?)", t.Node, t.Tool, o.Installed); err != nil {
 			return err
 		}
 	}

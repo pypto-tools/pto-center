@@ -40,6 +40,8 @@ bin/pto-center register --state ./center-state --file ./demo-v1.json
 
 [注册清单 Schema](../protocol/v1/tool.schema.json) 是可执行的协议定义。[演示适配器](../examples/demo/adapter.py) 包含从安装、配置到回滚的例子。配置和动作参数的根 Schema 应是 `additionalProperties: false` 的对象。使用本地定义和引用，Agent 进行校验时无需联网。
 
+自定义动作的整个参数对象可以通过顶层 `$ref` 指向本地定义。把 `properties`、`required` 和 `additionalProperties: false` 一起放在被引用的对象里。中心在注册时检查字段与封闭对象的定义是否兼容，页面根据该定义生成表单，中心和 Agent 都按原始 Schema 校验参数。[示例动作清单](../examples/demo/pto-tool.json) · [JSON Schema 的封闭对象规则](https://json-schema.org/understanding-json-schema/reference/object#extending-closed-schemas)
+
 每次调用从 stdin 读取一个 JSON 对象。`taskId`、`tool`、`action`、`targetVersion` 和 `bundle` 标识已固定的任务与发布版本。自定义参数在 `params`，配置写入在 `values`，预览时已有的字段在 `expected`，缺失的键表示当时尚未设置。`validate-config` 接收完整候选配置，`apply-config` 只接收所选字段。适配器应在自己的本机写锁内再次核对基线，保存未托管字段及文件权限。
 
 适配器的当前目录和环境变量 `PTO_TOOL_DIR` 指向该工具在 Agent 下的私有状态目录。`PTO_RELEASE_FILE` 指向用 `pack --payload` 打包并校验的负载。动作来自注册清单，动态参数只作为 JSON 数据传递。stdout 每行一个 JSON 事件，可以先输出 `progress`，最后输出一个结果。`summary` 和 `data` 都会出现在网页和执行记录中，只返回适合管理员查看的数据。

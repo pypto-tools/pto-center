@@ -31,13 +31,20 @@
       "effect": "read",
       "supportsBatch": true,
       "inputSchema": {
-        "type": "object",
-        "properties": {
-          "days": {
-            "$ref": "#/$defs/days"
-          }
-        },
+        "$ref": "#/$defs/sampleInput",
         "$defs": {
+          "sampleInput": {
+            "type": "object",
+            "properties": {
+              "days": {
+                "$ref": "#/$defs/days"
+              }
+            },
+            "required": [
+              "days"
+            ],
+            "additionalProperties": false
+          },
           "days": {
             "title": "最近多少天",
             "type": "integer",
@@ -45,11 +52,7 @@
             "maximum": 30,
             "default": 7
           }
-        },
-        "required": [
-          "days"
-        ],
-        "additionalProperties": false
+        }
       }
     }
   ]

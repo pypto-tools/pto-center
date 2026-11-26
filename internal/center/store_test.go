@@ -278,10 +278,79 @@ func TestCandidateBaselinesAndLegacyInventory(t *testing.T) {
 	if err != nil || len(state.Inventory) != 1 || !p.Same(state.Inventory[0].ConfigBySchema[1], old.Config) || state.Inventory[0].ConfigBySchema[2] != nil {
 		t.Fatalf("%+v %v", state, err)
 	}
+	probe(2, p.Inventory{Presence: "present"})
+	state, err = s.State()
+	if err != nil || !p.Same(state.Inventory[0].ConfigBySchema[1], old.Config) {
+		t.Fatalf("versionless probe lost baseline: %+v %v", state, err)
+	}
+	probe(2, p.Inventory{Presence: "present", Installed: "v2"})
+	state, err = s.State()
+	if err != nil || state.Inventory[0].ConfigBySchema[1] != nil {
+		t.Fatalf("old installation baseline survived v2: %+v %v", state, err)
+	}
+	probe(1, old)
 	probe(2, p.Inventory{Presence: "absent"})
 	state, err = s.State()
 	if err != nil || state.Inventory[0].Presence != "absent" || len(state.Inventory[0].ConfigBySchema) != 0 {
 		t.Fatalf("%+v %v", state, err)
+	}
+}
+
+func TestQueuedWriteUsesConfirmedPredecessorBaseline(t *testing.T) {
+	s, err := Open(t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	put := func(expected, values p.Values) (p.Task, error) {
+		task := p.Task{ID: Token(), Node: "node", Tool: "tool", Bundle: "bundle", Action: "apply-config", SchemaVersion: 1, Expected: expected, Values: values}
+		tx, err := s.db.Begin()
+		if err != nil {
+			return task, err
+		}
+		defer tx.Rollback()
+		if err = enqueue(tx, task, "admin"); err != nil {
+			return task, err
+		}
+		return task, tx.Commit()
+	}
+	next := func() p.Task {
+		t.Helper()
+		task, err := s.next(context.Background(), "node")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return task
+	}
+	finish := func(task p.Task, config p.Values) {
+		t.Helper()
+		if err := s.finish(task, p.Reply{ID: task.ID, Result: p.Result{Status: "succeeded"}, Inventory: &p.Inventory{Presence: "present", SchemaVersion: 1, Config: config}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err = put(p.Values{"x": 4}, p.Values{"x": 6}); err != nil {
+		t.Fatal(err)
+	}
+	a := next()
+	if _, err = put(p.Values{"x": 4, "y": 0}, p.Values{"x": 8, "y": 1}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = put(p.Values{"x": 6}, p.Values{"x": 9}); err == nil {
+		t.Fatal("unconfirmed value accepted")
+	}
+	finish(a, p.Values{"x": 6, "y": 0})
+	c, err := put(p.Values{"x": 6}, p.Values{"x": 9})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := next()
+	if !p.Same(b.Expected["x"], 6) {
+		t.Fatal(b)
+	}
+	finish(b, p.Values{"x": 8, "y": 1})
+	got := next()
+	if got.ID != c.ID || !p.Same(got.Expected["x"], 8) {
+		t.Fatal(got)
 	}
 }
 

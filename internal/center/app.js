@@ -71,7 +71,7 @@ const presence = {
 };
 let state, tool, action, chosen = new Set(), fields = [];
 let previewGeneration = 0, historyRequest = 0, historyEnd = 0, refreshRequest = 0;
-const historyCursors = [0];
+let historyCursors = [0], historyMore = false, historyNavigating = false;
 function table(target, head, rows) {
   target.replaceChildren();
   const header = target.createTHead().insertRow();
@@ -142,18 +142,37 @@ function overview() {
            })]);
   table(el('matrix'), ['节点', '分组', '连接', ...ids], rows);
 }
-async function renderHistory() {
+async function renderHistory(cursors = historyCursors) {
+  if (historyNavigating) return;
   const request = ++historyRequest;
-  const cursor = historyCursors.at(-1);
-  const page = cursor ? await api('history?before=' + cursor) : state;
-  if (request !== historyRequest) return;
-  historyEnd = page.tasks.at(-1)?.seq || 0;
-  el('older').disabled = !page.moreTasks;
-  el('newer').disabled = historyCursors.length === 1;
+  historyNavigating = cursors !== historyCursors;
+  if (historyNavigating) {
+    el('older').disabled = true;
+    el('newer').disabled = true;
+  }
+  try {
+    const cursor = cursors.at(-1);
+    const page = cursor ? await api('history?before=' + cursor) : state;
+    if (request !== historyRequest) return;
+    drawHistory(page.tasks);
+    historyCursors = cursors;
+    historyEnd = page.tasks.at(-1)?.seq || 0;
+    historyMore = page.moreTasks;
+  } catch (err) {
+    if (request === historyRequest) throw err;
+  } finally {
+    if (request === historyRequest) {
+      historyNavigating = false;
+      el('older').disabled = !historyMore;
+      el('newer').disabled = historyCursors.length === 1;
+    }
+  }
+}
+function drawHistory(tasks) {
   table(
       el('history-table'),
       ['节点 / 工具', '操作', '状态', '结果', '操作人 / 时间'],
-      page.tasks.map(t => {
+      tasks.map(t => {
         const details = make('details');
         details.append(
             make('summary', t.result?.summary || '详情'),
@@ -292,7 +311,19 @@ function fieldSchema(root, source, seen = new Set()) {
       }
     }
   }
-  return {...fieldSchema(root, ref, seen), ...source};
+  const target = fieldSchema(root, ref, seen);
+  const merged = {...target, ...source};
+  if (target.required && source.required)
+    merged.required = [...new Set([...target.required, ...source.required])];
+  if (target.properties && source.properties) {
+    merged.properties = Object.assign(Object.create(null), target.properties);
+    for (const [name, local] of Object.entries(source.properties)) {
+      const inherited = target.properties[name];
+      merged.properties[name] = local === true && inherited !== undefined ? inherited
+          : inherited && typeof local === 'object' ? {...inherited, ...local} : local;
+    }
+  }
+  return merged;
 }
 function jsonField(s) {
   return !!s.enum || !['integer', 'number', 'string'].includes(s.type);
@@ -317,8 +348,9 @@ function form() {
   if (!action || !tool) return;
   const config = action.id === 'apply-config';
   const schema = config ? tool.schema : action.inputSchema;
-  const required = schema?.required || [];
-  for (const [key, property] of Object.entries(schema?.properties || {})) {
+  const layout = fieldSchema(schema, schema);
+  const required = layout.required || [];
+  for (const [key, property] of Object.entries(layout.properties || {})) {
     const s = fieldSchema(schema, property);
     const wrap = make('div');
     wrap.className = 'field';
@@ -418,7 +450,9 @@ async function preview() {
     send.disabled = true;
     try {
       await api('publish', {id: plan.id});
-      historyCursors.length = 1;
+      ++historyRequest;
+      historyNavigating = false;
+      historyCursors = [0];
       el('dialog').close();
       location.hash = 'history';
       await refresh();
@@ -492,13 +526,11 @@ el('none').onclick = () => {
 };
 el('older').onclick = () => tryRun(() => {
   if (!historyEnd || el('older').disabled) return;
-  el('older').disabled = true;
-  historyCursors.push(historyEnd);
-  return renderHistory();
+  return renderHistory([...historyCursors, historyEnd]);
 });
 el('newer').onclick = () => tryRun(() => {
-  if (historyCursors.length > 1) historyCursors.pop();
-  return renderHistory();
+  if (historyCursors.length > 1 && !el('newer').disabled)
+    return renderHistory(historyCursors.slice(0, -1));
 });
 el('sync').onclick = () => tryRun(async () => {
   const rows = await api('sync', {});

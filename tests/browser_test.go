@@ -166,13 +166,17 @@ func TestBrowserBatchConfiguration(t *testing.T) {
 	    await new Promise(resolve => window.releasePreview = resolve);
 	  }
 	  return response;
-	}; document.querySelector('#preview').click();true`)
+	}; const previewButton=document.querySelector('#preview'), originalClick=previewButton.onclick;
+	previewButton.onclick=function(event) {
+	  this.onclick=originalClick;
+	  return originalClick.call(this,event).finally(() => window.oldPreviewFinished=true);
+	}; previewButton.click();true`)
 	d.wait("typeof window.releasePreview === 'function'")
 	d.eval(`[...document.querySelectorAll('#actions button')].find(b=>b.textContent==='查看采样窗口').click();document.querySelector('#all').click();
 	  const param = document.querySelector('#inputs input[type=number]');param.value='3';param.dispatchEvent(new Event('input'));
 	  document.querySelector('#preview').click();true`)
 	d.wait("document.querySelector('dialog').open && document.querySelector('#dialog-body').innerText.includes('\x22days\x22:3')")
-	d.eval("window.releasePreview(); setTimeout(() => window.oldPreviewFinished=true, 50); true")
+	d.eval("window.releasePreview();true")
 	d.wait("window.oldPreviewFinished && document.querySelector('#dialog-title').textContent.includes('查看采样窗口') && document.querySelector('#dialog-body').innerText.includes('days')")
 	d.eval("document.querySelector('#dialog-body .primary').click(); true")
 	l.until(func(s center.State) bool {
@@ -192,4 +196,29 @@ func TestBrowserBatchConfiguration(t *testing.T) {
 	d.wait("!state.nodes.find(n => n.name === 'node-b').enrolled")
 	d.eval("document.querySelector('#preview').click();true")
 	d.wait(`document.querySelector('dialog').open && document.querySelector('#dialog-body').innerText.includes('node-a') && !document.querySelector('#dialog-body').innerText.includes('node-b')`)
+	// Exercise the navigation controls with deterministic multi-page HTTP responses.
+	d.eval(`document.querySelector('#close').click(); location.hash='history';
+	Object.defineProperty(document,'hidden',{configurable:true,value:true});
+	const historyRow=state.tasks[0];
+	const testPage=(seq)=>({tasks:[{...historyRow,seq,node:'history-'+seq}],moreTasks:true});
+	Object.assign(state,testPage(301)); renderHistory();
+	window.historyCalls=0; window.fetch=async (...args)=>{
+	  if (!String(args[0]).startsWith('/api/history?')) return window.realFetch(...args);
+	  window.historyCalls++;
+	  if(window.historyCalls===1) throw Error('history fixture unavailable');
+	  if(window.historyCalls===4) await new Promise(resolve=>window.finishNewer=resolve);
+	  const cursor=Number(String(args[0]).split('=').pop());
+	  return new Response(JSON.stringify(testPage(cursor-100)));
+	};
+	document.querySelector('#older').click();true`)
+	d.wait(`document.querySelector('#notice').textContent.includes('history fixture unavailable') &&
+		!document.querySelector('#older').disabled && document.querySelector('#newer').disabled`)
+	d.eval("document.querySelector('#older').click();true")
+	d.wait("document.querySelector('#history-table').innerText.includes('history-201')")
+	d.eval("document.querySelector('#older').click();true")
+	d.wait("document.querySelector('#history-table').innerText.includes('history-101')")
+	d.eval("document.querySelector('#newer').click();true")
+	d.wait("typeof window.finishNewer==='function' && document.querySelector('#older').disabled && document.querySelector('#newer').disabled")
+	d.eval("document.querySelector('#older').click();window.finishNewer();true")
+	d.wait("window.historyCalls===4 && document.querySelector('#history-table').innerText.includes('history-201') && !document.querySelector('#older').disabled")
 }
