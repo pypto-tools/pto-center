@@ -1,0 +1,22 @@
+[Unit]
+Description=PTO Center
+After=network-online.target netbird.service
+Wants=network-online.target
+
+[Service]
+User=pto-center
+Group=pto-center
+EnvironmentFile=/home/pypto-tools/pto-center/config/center.env
+ExecStart=/home/pypto-tools/pto-center/app/pto-center serve --state /home/pypto-tools/pto-center/state --admin ${ADMIN_LISTEN} --nodes ${NODE_LISTEN} --interface ${NETBIRD_INTERFACE} --cert ${TLS_CERT} --key ${TLS_KEY}
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/pypto-tools/pto-center/state
+AmbientCapabilities=CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_RAW
+
+[Install]
+WantedBy=multi-user.target

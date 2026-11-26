@@ -1,0 +1,21 @@
+{
+  "type": "object",
+  "properties": {
+    "maxConcurrent": {
+      "title": "最大并发数",
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 64
+    },
+    "label": {
+      "title": "节点标签",
+      "type": "string",
+      "maxLength": 60
+    }
+  },
+  "required": [
+    "maxConcurrent",
+    "label"
+  ],
+  "additionalProperties": false
+}

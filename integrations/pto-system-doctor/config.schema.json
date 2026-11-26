@@ -1,0 +1,22 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "HEALTHY_POLL_SECONDS": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 3600,
+      "title": "健康状态轮询间隔（秒）"
+    },
+    "ALERT_COOLDOWN_SECONDS": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 86400,
+      "title": "告警冷却时间（秒）"
+    }
+  },
+  "required": [
+    "HEALTHY_POLL_SECONDS",
+    "ALERT_COOLDOWN_SECONDS"
+  ]
+}

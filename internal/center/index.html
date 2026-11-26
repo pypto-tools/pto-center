@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>
+      PTO Center · 服务器工具管理
+    </title>
+    <link rel="stylesheet" href="/style.css">
+    <script defer src="/app.js">
+    </script>
+  </head>
+  <body>
+    <header>
+      <a class="brand" href="#fleet">
+        PTO
+        <strong>
+          Center
+        </strong>
+      </a>
+      <nav aria-label="管理页面">
+        <a href="#fleet">
+          主机总览
+        </a>
+        <a href="#tools">
+          工具与配置
+        </a>
+        <a href="#history">
+          发布记录
+        </a>
+      </nav>
+      <button id="refresh">
+        刷新页面数据
+      </button>
+    </header>
+    <main>
+      <div id="notice" role="status" aria-live="polite">
+      </div>
+      <section id="fleet">
+        <div class="heading">
+          <h1>
+            主机总览
+          </h1>
+          <button id="invite" class="admin">
+            注册节点
+          </button>
+        </div>
+        <div id="metrics" class="metrics">
+        </div>
+        <div class="panel">
+          <h2>
+            工具盘点
+          </h2>
+          <div class="scroll">
+            <table id="matrix">
+            </table>
+          </div>
+        </div>
+      </section>
+      <section id="tools" hidden>
+        <div class="heading">
+          <h1>
+            工具与配置
+          </h1>
+          <button id="register" class="admin">
+            注册发布包
+          </button>
+        </div>
+        <div class="panel">
+          <label for="tool">
+            工具及发布版本
+          </label>
+          <div class="row">
+            <select id="tool">
+            </select>
+            <button class="admin" id="sync">
+              同步仓库版本
+            </button>
+          </div>
+          <p id="tool-empty" hidden>
+            注册工具发布包后即可查看配置和动作。
+          </p>
+        </div>
+        <div id="operations" hidden>
+          <div class="panel">
+            <h2>
+              目标机器
+            </h2>
+            <div class="row">
+              <input id="filter" placeholder="按机器名称或分组筛选" aria-label="筛选机器">
+              <button id="all">
+                全选筛选结果
+              </button>
+              <button id="none">
+                清空选择
+              </button>
+            </div>
+            <div id="targets" class="targets">
+            </div>
+          </div>
+          <div class="panel">
+            <h2>
+              可用操作
+            </h2>
+            <div id="actions" class="row">
+            </div>
+            <div id="inputs">
+            </div>
+            <button id="preview" class="primary">
+              预览逐机任务
+            </button>
+          </div>
+        </div>
+      </section>
+      <section id="history" hidden>
+        <div class="heading">
+          <h1>
+            发布记录
+          </h1>
+        </div>
+        <div class="panel">
+          <div class="scroll">
+            <table id="history-table">
+            </table>
+          </div>
+          <div class="row" aria-label="发布记录分页">
+            <button id="newer" disabled>较新记录</button>
+            <button id="older" disabled>较早记录</button>
+          </div>
+        </div>
+      </section>
+    </main>
+    <dialog id="dialog" aria-labelledby="dialog-title">
+      <div class="heading">
+        <h2 id="dialog-title">
+        </h2>
+        <button id="close" aria-label="关闭">
+          关闭
+        </button>
+      </div>
+      <div id="dialog-body">
+      </div>
+    </dialog>
+  </body>
+</html>

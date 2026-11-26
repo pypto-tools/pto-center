@@ -1,0 +1,59 @@
+{
+  "apiVersion": "pto-center/v1",
+  "id": "demo-service",
+  "source": {
+    "type": "git",
+    "repository": "pypto-tools/pto-center"
+  },
+  "adapter": "adapter.py",
+  "capabilities": [
+    "probe",
+    "install",
+    "update",
+    "activate",
+    "rollback",
+    "read-config",
+    "validate-config",
+    "apply-config"
+  ],
+  "configSchema": "config.schema.json",
+  "configSchemaVersion": 1,
+  "actions": [
+    {
+      "id": "custom.status",
+      "title": "查看服务状态",
+      "effect": "read",
+      "supportsBatch": true
+    },
+    {
+      "id": "custom.sample",
+      "title": "查看采样窗口",
+      "effect": "read",
+      "supportsBatch": true,
+      "inputSchema": {
+        "$ref": "#/$defs/sampleInput",
+        "$defs": {
+          "sampleInput": {
+            "type": "object",
+            "properties": {
+              "days": {
+                "$ref": "#/$defs/days"
+              }
+            },
+            "required": [
+              "days"
+            ],
+            "additionalProperties": false
+          },
+          "days": {
+            "title": "最近多少天",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 30,
+            "default": 7
+          }
+        }
+      }
+    }
+  ]
+}
