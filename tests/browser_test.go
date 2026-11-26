@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -93,13 +95,44 @@ func TestBrowserBatchConfiguration(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(ctx, chrome, "--headless=new", "--disable-gpu", "--no-sandbox", "--disable-dev-shm-usage", "--disable-background-networking", "--remote-debugging-port=0", "--user-data-dir="+profile, "about:blank")
 	cmd.Stderr = os.Stderr
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
 		cancel()
 		t.Fatal(err)
 	}
 	exited := make(chan error, 1)
 	go func() { exited <- cmd.Wait(); close(exited) }()
-	defer func() { cancel(); <-exited }()
+	var conn *websocket.Conn
+	defer func() {
+		if conn != nil {
+			// Let the browser flush its profile and stop its renderers itself.
+			conn.SetWriteDeadline(time.Now().Add(time.Second))
+			err := conn.WriteJSON(map[string]any{"id": 1 << 30, "method": "Browser.close"})
+			conn.Close()
+			if err == nil {
+				select {
+				case <-exited:
+				case <-time.After(5 * time.Second):
+				}
+			}
+		}
+		// Also cover failed startup and children of an unresponsive browser.
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		cancel()
+		<-exited
+		// A renderer exiting alongside Chrome can still finish a filesystem call.
+		for until := time.Now().Add(3 * time.Second); ; {
+			err := os.RemoveAll(profile)
+			if err == nil {
+				break
+			}
+			if !errors.Is(err, syscall.ENOTEMPTY) || time.Now().After(until) {
+				t.Errorf("remove Chromium profile: %v", err)
+				break
+			}
+			time.Sleep(30 * time.Millisecond)
+		}
+	}()
 	client := &http.Client{Timeout: 2 * time.Second}
 	var endpoint string
 	var startupErr error
@@ -139,11 +172,11 @@ func TestBrowserBatchConfiguration(t *testing.T) {
 	if endpoint == "" {
 		t.Fatalf("Chromium test page unavailable: %v", startupErr)
 	}
-	conn, _, err := websocket.DefaultDialer.Dial(endpoint, nil)
+	var err error
+	conn, _, err = websocket.DefaultDialer.Dial(endpoint, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close()
 	d := devTools{t: t, conn: conn}
 	d.call("Network.enable", map[string]any{})
 	d.call("Network.setExtraHTTPHeaders", map[string]any{"headers": map[string]string{"Authorization": "Basic " + base64.StdEncoding.EncodeToString([]byte("admin:test-admin"))}})
