@@ -34,6 +34,11 @@
         "type": "object",
         "properties": {
           "days": {
+            "$ref": "#/$defs/days"
+          }
+        },
+        "$defs": {
+          "days": {
             "title": "最近多少天",
             "type": "integer",
             "minimum": 1,

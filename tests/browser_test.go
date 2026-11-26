@@ -136,8 +136,10 @@ func TestBrowserBatchConfiguration(t *testing.T) {
 	d.call("Network.setExtraHTTPHeaders", map[string]any{"headers": map[string]string{"Authorization": "Basic " + base64.StdEncoding.EncodeToString([]byte("admin:test-admin"))}})
 	d.call("Page.navigate", map[string]any{"url": ui.URL + "/#tools"})
 	d.wait("document.querySelectorAll('#actions button').length > 0")
-	d.eval(`[...document.querySelectorAll('#actions button')].find(b=>b.textContent==='下发配置').click(); document.querySelector('#all').click(); true`)
-	d.eval(`(()=>{const i=document.querySelector('input[aria-label="最大并发数"]');i.value='9';i.dispatchEvent(new Event('input'));document.querySelector('#preview').click();return true})()`)
+	d.eval(`[...document.querySelectorAll('#actions button')].find(b=>b.textContent==='下发配置').click(); document.querySelector('#targets input').click(); true`)
+	d.eval(`(()=>{const i=document.querySelector('input[aria-label="最大并发数"]');i.value='9';i.dispatchEvent(new Event('input'));document.querySelector('#all').click();return true})()`)
+	d.wait(`document.querySelector('input[aria-label="最大并发数"]').value === '9'`)
+	d.eval(`document.querySelector('#preview').click();true`)
 	d.wait("document.querySelector('dialog').open && document.querySelector('#dialog-body').innerText.includes('4 → 9')")
 	d.eval("document.querySelector('#dialog-body .primary').click(); true")
 	d.wait("location.hash === '#history'")
@@ -156,8 +158,22 @@ func TestBrowserBatchConfiguration(t *testing.T) {
 		return true
 	})
 	d.eval("location.hash='tools'; true")
-	d.eval(`[...document.querySelectorAll('#actions button')].find(b=>b.textContent==='查看采样窗口').click();document.querySelector('#all').click();document.querySelector('#preview').click();true`)
-	d.wait("document.querySelector('dialog').open && document.querySelector('#dialog-body').innerText.includes('days')")
+	// Hold one response until a different action has obtained its own preview.
+	d.eval(`window.realFetch = window.fetch; window.fetch = async (...args) => {
+	  const response = await window.realFetch(...args);
+	  if (args[0] === '/api/preview') {
+	    window.fetch = window.realFetch;
+	    await new Promise(resolve => window.releasePreview = resolve);
+	  }
+	  return response;
+	}; document.querySelector('#preview').click();true`)
+	d.wait("typeof window.releasePreview === 'function'")
+	d.eval(`[...document.querySelectorAll('#actions button')].find(b=>b.textContent==='查看采样窗口').click();document.querySelector('#all').click();
+	  const param = document.querySelector('#inputs input[type=number]');param.value='3';param.dispatchEvent(new Event('input'));
+	  document.querySelector('#preview').click();true`)
+	d.wait("document.querySelector('dialog').open && document.querySelector('#dialog-body').innerText.includes('\x22days\x22:3')")
+	d.eval("window.releasePreview(); setTimeout(() => window.oldPreviewFinished=true, 50); true")
+	d.wait("window.oldPreviewFinished && document.querySelector('#dialog-title').textContent.includes('查看采样窗口') && document.querySelector('#dialog-body').innerText.includes('days')")
 	d.eval("document.querySelector('#dialog-body .primary').click(); true")
 	l.until(func(s center.State) bool {
 		count := 0
@@ -168,4 +184,12 @@ func TestBrowserBatchConfiguration(t *testing.T) {
 		}
 		return count == 2
 	})
+	d.eval(`location.hash='tools'; const filter=document.querySelector('#filter'); filter.value='node-a';filter.dispatchEvent(new Event('input'));true`)
+	if err := l.store.Revoke("node-b"); err != nil {
+		t.Fatal(err)
+	}
+	d.eval("document.querySelector('#refresh').click();true")
+	d.wait("!state.nodes.find(n => n.name === 'node-b').enrolled")
+	d.eval("document.querySelector('#preview').click();true")
+	d.wait(`document.querySelector('dialog').open && document.querySelector('#dialog-body').innerText.includes('node-a') && !document.querySelector('#dialog-body').innerText.includes('node-b')`)
 }

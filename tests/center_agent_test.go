@@ -317,25 +317,48 @@ func TestListenerAndRouteIsolation(t *testing.T) {
 		t.Fatal("wildcard binding accepted")
 	}
 	l := newLab(t)
+	invite, err := l.store.Invite("node", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := center.Token()
+	if err = l.store.Enroll("node", invite, key); err != nil {
+		t.Fatal(err)
+	}
 	for _, path := range []string{"/", "/api/state", "/app.js"} {
-		res, err := l.nodes.Client().Get(l.nodes.URL + path)
+		req, err := http.NewRequest("GET", l.nodes.URL+path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("X-PTO-Node", "node")
+		req.Header.Set("Authorization", "Bearer "+key)
+		res, err := l.nodes.Client().Do(req)
 		if err != nil {
 			t.Fatal(err)
 		}
 		res.Body.Close()
-		if res.StatusCode == 200 {
-			t.Fatal(path)
+		if res.StatusCode != http.StatusNotFound {
+			t.Fatalf("%s status=%d", path, res.StatusCode)
 		}
 	}
-	req, _ := http.NewRequest("POST", l.admin.URL+"/api/invite", strings.NewReader(`{"name":"x"}`))
-	req.SetBasicAuth("admin", "test-admin")
-	res, err := l.admin.Client().Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	res.Body.Close()
-	if res.StatusCode != 403 {
-		t.Fatal("cross-site mutation accepted")
+	for _, tc := range []struct {
+		header, origin string
+		status         int
+	}{
+		{"", l.admin.URL, 403}, {"1", "https://unrelated.invalid", 403}, {"1", l.admin.URL, 201},
+	} {
+		req, _ := http.NewRequest("POST", l.admin.URL+"/api/invite", strings.NewReader(`{"name":"x"}`))
+		req.SetBasicAuth("admin", "test-admin")
+		req.Header.Set("X-PTO-Request", tc.header)
+		req.Header.Set("Origin", tc.origin)
+		res, err := l.admin.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res.Body.Close()
+		if res.StatusCode != tc.status {
+			t.Fatalf("header=%q origin=%q status=%d", tc.header, tc.origin, res.StatusCode)
+		}
 	}
 	if code := l.request("wrong", "GET", "/api/state", nil, nil); code != 401 {
 		t.Fatal("admin login bypass")

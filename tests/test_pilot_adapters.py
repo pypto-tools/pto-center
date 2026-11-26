@@ -1,8 +1,12 @@
 """Exercise pilot adapters against temporary native layouts, without touching host services."""
 import importlib.util
+import os
 from pathlib import Path
+import stat
 import tempfile
+import threading
 import unittest
+from unittest.mock import patch
 
 
 def load(tool):
@@ -54,6 +58,58 @@ class PilotTest(unittest.TestCase):
             req = {"action": "custom.usage-report", "params": {"days": 3}}
             self.assertEqual(do(root, req)["status"], "succeeded")
             self.assertEqual(do(root, {**req, "params": {"days": 31}})["status"], "failed")
+
+    def test_doctor_serializes_replacements_and_reports_uncertain_sync(self):
+        doctor = load("pto-system-doctor")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "app").mkdir()
+            (root / "app/pto-system-doctor").touch()
+            (root / "config").mkdir()
+            path = root / "config/resource-guard.conf"
+            path.write_text("HEALTHY_POLL_SECONDS=10\nALERT_COOLDOWN_SECONDS=900\n")
+            req = {"action": "apply-config", "values": {"HEALTHY_POLL_SECONDS": 20},
+                   "expected": {"HEALTHY_POLL_SECONDS": 10}}
+            replacing, waiting = threading.Event(), threading.Event()
+            original_replace, original_lock = os.replace, doctor.fcntl.flock
+            replies = {}
+
+            def replace(src, dest):
+                replacing.set()
+                if not waiting.wait(3):
+                    raise RuntimeError("second operation never attempted its lock")
+                return original_replace(src, dest)
+
+            def lock(fd, mode):
+                if threading.current_thread().name == "second":
+                    waiting.set()
+                return original_lock(fd, mode)
+
+            def invoke(label, request):
+                replies[label] = doctor.invoke(root, request)["status"]
+
+            with patch.object(doctor.os, "replace", replace), patch.object(doctor.fcntl, "flock", lock):
+                first = threading.Thread(target=invoke, args=("first", req))
+                first.start()
+                self.assertTrue(replacing.wait(3))
+                second = threading.Thread(name="second", target=invoke,
+                                          args=("second", {**req, "values": req["expected"]}))
+                second.start()
+                first.join(4)
+                second.join(4)
+            self.assertEqual(replies, {"first": "pending-activation", "second": "conflict"})
+            sync = os.fsync
+
+            def sync_file_only(fd):
+                if stat.S_ISDIR(os.fstat(fd).st_mode):
+                    raise OSError("directory sync unavailable")
+                return sync(fd)
+
+            with patch.object(doctor.os, "fsync", sync_file_only):
+                result = doctor.invoke(root, {**req, "expected": req["values"],
+                                               "values": {"HEALTHY_POLL_SECONDS": 30}})
+            self.assertEqual(result["status"], "unknown")
+            self.assertIn("HEALTHY_POLL_SECONDS=30", path.read_text())
 
 
 if __name__ == "__main__":

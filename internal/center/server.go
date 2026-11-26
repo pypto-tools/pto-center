@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -112,6 +113,18 @@ func (s *Server) AdminHandler() http.Handler {
 					State
 					Role string `json:"role"`
 				}{state, name})
+			case "/api/history":
+				before, err := strconv.ParseInt(r.URL.Query().Get("before"), 10, 64)
+				if err != nil || before <= 0 {
+					problem(w, 400, errors.New("invalid history cursor"))
+					return
+				}
+				tasks, more, err := s.Store.History(before)
+				if err != nil {
+					problem(w, 500, err)
+					return
+				}
+				respond(w, 200, map[string]any{"tasks": tasks, "moreTasks": more})
 			case "/api/sources":
 				sources, err := s.sources()
 				if err != nil {
@@ -185,7 +198,7 @@ func (s *Server) AdminHandler() http.Handler {
 				problem(w, 400, err)
 				return
 			}
-			tool, err := s.registerSource(raw, in.Repository, in.Commit, in.Path, "")
+			tool, err := s.registerSource(raw, in.Repository, in.Commit, in.Path, nil)
 			if err != nil {
 				problem(w, 400, err)
 				return
@@ -319,7 +332,7 @@ func (s *Server) servePeer(w http.ResponseWriter, r *http.Request, node string) 
 		return
 	}
 	defer ws.Close()
-	ws.SetReadLimit(512 << 10)
+	ws.SetReadLimit(p.MaxReplyBytes)
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 	seen := func() { _, _ = s.Store.db.Exec("UPDATE nodes SET seen=? WHERE name=?", time.Now().Unix(), node) }

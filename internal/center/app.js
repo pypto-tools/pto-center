@@ -70,6 +70,8 @@ const presence = {
   unknown: '无法判定'
 };
 let state, tool, action, chosen = new Set(), fields = [];
+let previewGeneration = 0, historyRequest = 0, historyEnd = 0, refreshRequest = 0;
+const historyCursors = [0];
 function table(target, head, rows) {
   target.replaceChildren();
   const header = target.createTHead().insertRow();
@@ -90,6 +92,7 @@ function observation(name, id) {
   return state.inventory.find(i => i.node === name && i.tool === id);
 }
 function modal(title) {
+  ++previewGeneration;
   el('dialog-title').textContent = title;
   el('dialog-body').replaceChildren();
   if (!el('dialog').open) el('dialog').showModal();
@@ -138,10 +141,19 @@ function overview() {
                  (o.runningVersion || '未知') + revision;
            })]);
   table(el('matrix'), ['节点', '分组', '连接', ...ids], rows);
+}
+async function renderHistory() {
+  const request = ++historyRequest;
+  const cursor = historyCursors.at(-1);
+  const page = cursor ? await api('history?before=' + cursor) : state;
+  if (request !== historyRequest) return;
+  historyEnd = page.tasks.at(-1)?.seq || 0;
+  el('older').disabled = !page.moreTasks;
+  el('newer').disabled = historyCursors.length === 1;
   table(
       el('history-table'),
       ['节点 / 工具', '操作', '状态', '结果', '操作人 / 时间'],
-      state.tasks.map(t => {
+      page.tasks.map(t => {
         const details = make('details');
         details.append(
             make('summary', t.result?.summary || '详情'),
@@ -153,8 +165,11 @@ function overview() {
         ];
       }));
 }
-async function refresh(reset = false) {
-  state = await api('state');
+async function refresh() {
+  const request = ++refreshRequest;
+  const response = await api('state');
+  if (request !== refreshRequest) return;
+  state = response;
   overview();
   document.querySelectorAll('.admin').forEach(
       e => e.hidden = state.role !== 'admin');
@@ -166,18 +181,21 @@ async function refresh(reset = false) {
     el('tool').append(opt);
   }
   if (state.tools.some(t => t.digest === old)) el('tool').value = old;
-  if (reset || tool?.digest !== el('tool').value)
+  if (tool?.digest !== el('tool').value)
     chooseTool();
   else
     targets();
+  await renderHistory();
 }
 function chooseTool() {
+  ++previewGeneration;
   tool = state.tools.find(t => t.digest === el('tool').value);
   el('tool-empty').hidden = !!tool;
   el('operations').hidden = !tool;
-  if (!tool) return;
   chosen.clear();
   action = null;
+  fields = [];
+  if (!tool) return;
   el('actions').replaceChildren();
   const all = [
     ...tool.manifest.capabilities.filter(x => x !== 'validate-config')
@@ -211,37 +229,86 @@ function eligible(n) {
 }
 function targets() {
   if (!tool) return;
+  const allowed = new Set(state.nodes.filter(eligible).map(n => n.name));
+  for (const name of chosen) {
+    if (!allowed.has(name)) {
+      chosen.delete(name);
+      ++previewGeneration;
+    }
+  }
   el('targets').replaceChildren();
   for (const n of state.nodes.filter(matches)) {
     const label = make('label'), cb = make('input');
     cb.type = 'checkbox';
     cb.checked = chosen.has(n.name);
     cb.disabled = !eligible(n);
-    if (cb.disabled) {
-      chosen.delete(n.name);
-      cb.checked = false;
-    }
     cb.onchange = () => {
+      ++previewGeneration;
       if (cb.checked)
         chosen.add(n.name);
       else
         chosen.delete(n.name);
-      form();
+      updateBaselines();
     };
     label.append(
         cb, document.createTextNode(n.name + (n.online ? '' : ' · 离线')));
     el('targets').append(label);
   }
+  updateBaselines();
 }
 function selectAction(a, b) {
+  if (action?.id === a.id) return;
+  ++previewGeneration;
   action = a;
-  for (const n of state.nodes) {
-    if (!eligible(n)) chosen.delete(n.name);
-  }
+  fields = [];
   el('actions').querySelectorAll('button').forEach(
       x => x.classList.toggle('chosen', x === b));
   targets();
   form();
+}
+// Resolve JSON Pointer fragments (including escaped keys) and local anchors.
+// Validation of the full schema remains on the center and agent.
+function fieldSchema(root, source, seen = new Set()) {
+  if (!source || typeof source !== 'object') return {};
+  if (!source.$ref || seen.has(source)) return source;
+  seen.add(source);
+  if (!source.$ref.startsWith('#')) return source;
+  const fragment = decodeURIComponent(source.$ref.slice(1));
+  let ref = root;
+  if (fragment.startsWith('/')) {
+    for (const part of fragment.slice(1).split('/')) {
+      const key = part.replaceAll('~1', '/').replaceAll('~0', '~');
+      if (!ref || !Object.hasOwn(ref, key)) return source;
+      ref = ref[key];
+    }
+  } else if (fragment) {
+    const pending = [root];
+    ref = null;
+    while (pending.length) {
+      const value = pending.pop();
+      if (value.$anchor === fragment || value.$dynamicAnchor === fragment) { ref = value; break; }
+      for (const child of Object.values(value)) {
+        if (child && typeof child === 'object') pending.push(child);
+      }
+    }
+  }
+  return {...fieldSchema(root, ref, seen), ...source};
+}
+function jsonField(s) {
+  return !!s.enum || !['integer', 'number', 'string'].includes(s.type);
+}
+function setValue(input, s, value) {
+  input.value = value === undefined ? '' : jsonField(s) ? JSON.stringify(value) : String(value);
+}
+function updateBaselines() {
+  if (action?.id !== 'apply-config') return;
+  for (const f of fields) {
+    const all = [...chosen].map(n => observation(n, tool.manifest.id)
+        ?.configBySchema?.[tool.manifest.configSchemaVersion]?.[f.key]);
+    const same = all.every(x => JSON.stringify(x) === JSON.stringify(all[0]));
+    f.baseline.textContent = all.length ? '当前值 · ' + (same ? display(all[0]) : '多个值') : '';
+    if (!f.edited) setValue(f.input, f.s, same ? all[0] : undefined);
+  }
 }
 function form() {
   const area = el('inputs');
@@ -251,7 +318,8 @@ function form() {
   const config = action.id === 'apply-config';
   const schema = config ? tool.schema : action.inputSchema;
   const required = schema?.required || [];
-  for (const [key, s] of Object.entries(schema?.properties || {})) {
+  for (const [key, property] of Object.entries(schema?.properties || {})) {
+    const s = fieldSchema(schema, property);
     const wrap = make('div');
     wrap.className = 'field';
     const label = make('label'), toggle = make('input');
@@ -269,41 +337,38 @@ function form() {
         option.value = JSON.stringify(v);
         input.append(option);
       }
-    } else if (['object', 'array'].includes(s.type)) {
+    } else if (jsonField(s)) {
       input = make('textarea');
     } else {
       input = make('input');
       input.type = ['integer', 'number'].includes(s.type) ? 'number' : 'text';
     }
     input.setAttribute('aria-label', s.title || key);
-    let value = config ? undefined : s.default;
-    if (config && chosen.size) {
-      const all =
-          [...chosen].map(n => observation(n, tool.manifest.id)?.config?.[key]);
-      const same = all.every(x => JSON.stringify(x) === JSON.stringify(all[0]));
-      if (same) value = all[0];
-      wrap.append(make(
-          'small', same ? '当前值 · ' + display(value) : '当前值 · 多个值'));
-    }
-    if (value !== undefined)
-      input.value =
-          (s.enum || s.type === 'boolean' || typeof value === 'object') ?
-          JSON.stringify(value) :
-          String(value);
+    const baseline = make('small');
+    if (config) wrap.append(baseline);
+    else if (s.default !== undefined) setValue(input, s, s.default);
+    const field = {key, s, toggle, input, baseline, edited: false};
+    toggle.onchange = () => {
+      field.edited = true;
+      ++previewGeneration;
+    };
     input.oninput = () => {
+      field.edited = true;
+      ++previewGeneration;
       toggle.checked = true;
     };
     wrap.append(input);
     area.append(wrap);
-    fields.push({key, s, toggle, input});
+    fields.push(field);
   }
+  updateBaselines();
 }
 function values() {
-  const result = {};
+  const result = Object.create(null);
   for (const {key, s, toggle, input} of fields) {
     if (!toggle.checked) continue;
     let v = input.value;
-    if (s.enum || ['boolean', 'object', 'array'].includes(s.type))
+    if (jsonField(s))
       v = JSON.parse(v);
     else if (['integer', 'number'].includes(s.type)) {
       if (v === '' || !Number.isFinite(Number(v)))
@@ -318,15 +383,24 @@ async function preview() {
   if (!tool || !action || !chosen.size)
     throw Error('请先选择工具、操作和目标机器');
   const v = values();
-  const cfg = action.id === 'apply-config';
-  const plan = await api('preview', {
-    bundle: tool.digest,
-    action: action.id,
-    nodes: [...chosen],
-    params: cfg ? {} : v,
-    values: cfg ? v : {}
-  });
-  const root = modal('确认发布 · ' + action.title);
+  const selectedAction = action;
+  const generation = ++previewGeneration;
+  const cfg = selectedAction.id === 'apply-config';
+  let plan;
+  try {
+    plan = await api('preview', {
+      bundle: tool.digest,
+      action: selectedAction.id,
+      nodes: [...chosen],
+      params: cfg ? {} : v,
+      values: cfg ? v : {}
+    });
+  } catch (err) {
+    if (generation === previewGeneration) throw err;
+    return;
+  }
+  if (generation !== previewGeneration) return;
+  const root = modal('确认发布 · ' + selectedAction.title);
   const tbl = make('table');
   table(
       tbl, ['目标机器', '目标版本', '变更或参数'],
@@ -344,6 +418,7 @@ async function preview() {
     send.disabled = true;
     try {
       await api('publish', {id: plan.id});
+      historyCursors.length = 1;
       el('dialog').close();
       location.hash = 'history';
       await refresh();
@@ -365,7 +440,7 @@ function register() {
         const b = JSON.parse(await file.files[0].text());
         await api('register', b);
         el('dialog').close();
-        await refresh(true);
+        await refresh();
       }));
   const inputs =
       ['GitHub owner/repository', '完整提交 ID', '发布包相对路径'].map(t => {
@@ -381,7 +456,7 @@ function register() {
       path: inputs[2].value
     });
     el('dialog').close();
-    await refresh(true);
+    await refresh();
   }));
 }
 function invite() {
@@ -405,16 +480,26 @@ el('preview').onclick = () => tryRun(preview);
 el('tool').onchange = chooseTool;
 el('filter').oninput = targets;
 el('all').onclick = () => {
+  ++previewGeneration;
   state.nodes.filter(n => matches(n) && eligible(n))
       .forEach(n => chosen.add(n.name));
   targets();
-  form();
 };
 el('none').onclick = () => {
+  ++previewGeneration;
   chosen.clear();
   targets();
-  form();
 };
+el('older').onclick = () => tryRun(() => {
+  if (!historyEnd || el('older').disabled) return;
+  el('older').disabled = true;
+  historyCursors.push(historyEnd);
+  return renderHistory();
+});
+el('newer').onclick = () => tryRun(() => {
+  if (historyCursors.length > 1) historyCursors.pop();
+  return renderHistory();
+});
 el('sync').onclick = () => tryRun(async () => {
   const rows = await api('sync', {});
   const root = modal('仓库同步结果');
@@ -424,9 +509,9 @@ el('sync').onclick = () => tryRun(async () => {
     root.append(make('p', r.repository + ' · ' + r.path + ' · ' + r.message));
   await refresh();
 });
-addEventListener('hashchange', showTab);
+addEventListener('hashchange', () => { ++previewGeneration; showTab(); });
 showTab();
-tryRun(() => refresh(true));
+tryRun(refresh);
 setInterval(() => {
   if (!document.hidden && !el('dialog').open) tryRun(() => refresh());
 }, 8000);

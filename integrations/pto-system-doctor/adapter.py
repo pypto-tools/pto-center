@@ -39,12 +39,23 @@ def invoke(root, req):
         return result("succeeded", presence, {"presence": presence})
     if not command.is_file():
         return result("skipped", "未找到已安装的工具")
+    # Every adapter invocation locks the stable config directory before opening
+    # the replaceable file. Shared readers need no write access to the directory.
+    folder = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        mode = fcntl.LOCK_EX if req["action"] == "apply-config" else fcntl.LOCK_SH
+        fcntl.flock(folder, mode)
+        return configure(path, folder, req)
+    finally:
+        os.close(folder)
+
+
+def configure(path, folder, req):
     if path.is_symlink() or not path.is_file():
         return result("failed", "资源配置必须是本机的常规文件")
 
     # Coordinate adapter writers and preserve the native file's unrelated settings and metadata.
     with path.open("rb") as source:
-        fcntl.flock(source, fcntl.LOCK_EX if req["action"] == "apply-config" else fcntl.LOCK_SH)
         original = source.read()
         lines = original.decode().splitlines(keepends=True)
         actual = current(lines)
@@ -81,11 +92,10 @@ def invoke(root, req):
             if not os.path.samestat(os.fstat(source.fileno()), path.stat()) or path.read_bytes() != original:
                 return result("conflict", "配置在写入前已变化")
             os.replace(temp, path)
-            fd = os.open(path.parent, os.O_DIRECTORY)
             try:
-                os.fsync(fd)
-            finally:
-                os.close(fd)
+                os.fsync(folder)
+            except OSError:
+                return result("unknown", "配置已替换，目录同步失败，需重新核实")
         finally:
             if temp is not None:
                 temp.unlink(missing_ok=True)

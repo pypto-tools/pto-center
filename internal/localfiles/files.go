@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 )
 
 func Key(path string, length int) ([]byte, error) {
@@ -35,11 +36,25 @@ func Create(path string, data []byte, mode os.FileMode) error {
 	if err == nil {
 		err = f.Sync()
 	}
-	cerr := f.Close()
+	closeErr := f.Close()
+	if err == nil {
+		err = closeErr
+	}
+	if err == nil {
+		err = SyncDir(filepath.Dir(path))
+	}
+	if err != nil {
+		return errors.Join(err, os.Remove(path))
+	}
+	return nil
+}
+func SyncDir(path string) error {
+	d, err := os.Open(path)
 	if err != nil {
 		return err
 	}
-	return cerr
+	defer d.Close()
+	return d.Sync()
 }
 func PrivateDir(path string) (string, error) {
 	path, err := filepath.Abs(path)
@@ -59,7 +74,7 @@ func PrivateDir(path string) (string, error) {
 	return path, nil
 }
 func ReadLimit(path string, limit int64) ([]byte, error) {
-	f, err := os.Open(path)
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return nil, err
 	}

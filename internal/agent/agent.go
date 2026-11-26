@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/pypto-tools/pto-center/internal/localfiles"
 	p "github.com/pypto-tools/pto-center/protocol/v1"
 )
 
@@ -61,12 +62,7 @@ func atomicFile(path string, data []byte, mode os.FileMode) error {
 	if err = os.Rename(f.Name(), path); err != nil {
 		return err
 	}
-	d, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	defer d.Close()
-	return d.Sync()
+	return localfiles.SyncDir(dir)
 }
 func (a Agent) credential() (string, error) {
 	path := filepath.Join(a.Dir, "credential")
@@ -102,6 +98,12 @@ func (a Agent) Run(ctx context.Context) error {
 		return errors.New("HTTPS required outside loopback demo")
 	}
 	if err = os.MkdirAll(a.Dir, 0700); err != nil {
+		return err
+	}
+	if err = os.MkdirAll(filepath.Join(a.Dir, "journal"), 0700); err != nil {
+		return err
+	}
+	if err = localfiles.SyncDir(a.Dir); err != nil {
 		return err
 	}
 	lock, err := os.OpenFile(filepath.Join(a.Dir, "agent.lock"), os.O_CREATE|os.O_RDWR, 0600)
@@ -180,7 +182,7 @@ func (a Agent) connect(ctx context.Context, key string) error {
 	session, cancel := context.WithCancel(ctx)
 	defer cancel()
 	go func() { <-session.Done(); ws.Close() }()
-	ws.SetReadLimit(1 << 20)
+	ws.SetReadLimit(p.MaxTaskBytes)
 	tasks := make(chan p.Task)
 	go func() {
 		defer cancel()
@@ -205,7 +207,7 @@ func (a Agent) connect(ctx context.Context, key string) error {
 		}
 		report := func(event p.Result) error {
 			ws.SetWriteDeadline(time.Now().Add(15 * time.Second))
-			return ws.WriteJSON(p.Reply{ID: task.ID, Result: event})
+			return ws.WriteJSON(boundedReply(p.Reply{ID: task.ID, Result: event}))
 		}
 		reply, err := a.handle(ctx, key, task, report)
 		if err != nil {
@@ -269,7 +271,24 @@ func (a Agent) load(ctx context.Context, key, digest string) (p.Tool, p.Release,
 
 type journal struct {
 	TaskHash string   `json:"taskHash"`
+	Effect   string   `json:"effect,omitempty"`
 	Reply    *p.Reply `json:"reply,omitempty"`
+}
+
+func boundedReply(reply p.Reply) p.Reply {
+	fits := func() bool {
+		raw, err := json.Marshal(reply)
+		return err == nil && p.FitsFrame(raw, p.MaxReplyBytes)
+	}
+	if fits() {
+		return reply
+	}
+	reply.Result = p.Result{Status: reply.Result.Status, Summary: "回执超出传输上限，已省略结果详情"}
+	if !fits() {
+		reply.Inventory = nil
+		reply.Result.Summary = "回执超出传输上限，已省略盘点和结果详情，请重新盘点"
+	}
+	return reply
 }
 
 func (a Agent) handle(ctx context.Context, key string, t p.Task, emit func(p.Result) error) (p.Reply, error) {
@@ -294,28 +313,38 @@ func (a Agent) handle(ctx context.Context, key string, t p.Task, emit func(p.Res
 			return reply, errors.New("task ID reused for different request")
 		}
 		if j.Reply != nil {
-			return *j.Reply, nil
+			return boundedReply(*j.Reply), nil
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return reply, err
 	}
-	tool, release, err := a.load(ctx, key, t.Bundle)
-	if err != nil {
-		return fail(err)
-	}
-	action, ok := tool.Manifest.Action(t.Action)
-	if !ok || t.Tool != tool.Manifest.ID || t.Version != tool.Version {
-		return fail(errors.New("task does not match registered release or action"))
-	}
-	if started && action.Effect == "change" {
-		reply.Result = p.Result{Status: "unknown", Summary: "上次执行中断，需核对本机状态"}
-	} else {
-		data, _ := json.Marshal(j)
-		if err = atomicFile(path, data, 0600); err != nil {
-			return reply, err
+	if !started || j.Effect != "change" {
+		tool, release, loadErr := a.load(ctx, key, t.Bundle)
+		if loadErr != nil {
+			if !started || j.Effect == "read" {
+				return fail(loadErr)
+			}
+			// Legacy start records have no effect. Without the signed bundle we
+			// cannot prove that the interrupted action was read-only.
+		} else {
+			action, ok := tool.Manifest.Action(t.Action)
+			if !ok || t.Tool != tool.Manifest.ID || t.Version != tool.Version {
+				return fail(errors.New("task does not match registered release or action"))
+			}
+			j.Effect = action.Effect
+			if !started || action.Effect == "read" {
+				data, _ := json.Marshal(j)
+				if err = atomicFile(path, data, 0600); err != nil {
+					return reply, err
+				}
+				reply = a.execute(ctx, t, tool, release, emit)
+			}
 		}
-		reply = a.execute(ctx, t, tool, release, emit)
 	}
+	if reply.Result.Status == "" {
+		reply.Result = p.Result{Status: "unknown", Summary: "上次执行中断，需核对本机状态"}
+	}
+	reply = boundedReply(reply)
 	j.Reply = &reply
 	data, err := json.Marshal(j)
 	if err != nil {
@@ -373,6 +402,9 @@ func (r adapter) call(ctx context.Context, t p.Task, emit func(p.Result) error) 
 		case <-time.After(time.Duration(1<<attempt) * 10 * time.Millisecond):
 		}
 	}
+	// A detached child can retain stdout even after its parent exits.
+	stopRead := context.AfterFunc(deadline, func() { _ = out.Close() })
+	defer stopRead()
 	scan := bufio.NewScanner(out)
 	scan.Buffer(make([]byte, 4096), 256<<10)
 	var final p.Result
@@ -399,10 +431,14 @@ func (r adapter) call(ctx context.Context, t p.Task, emit func(p.Result) error) 
 	if err == nil {
 		err = scan.Err()
 	}
+	contextErr := deadline.Err()
 	if err != nil {
 		cancel()
 	}
 	wait := cmd.Wait()
+	if contextErr != nil || err == nil && deadline.Err() != nil {
+		return final, deadline.Err()
+	}
 	if err != nil {
 		return final, err
 	}
@@ -590,7 +626,7 @@ func (a Agent) execute(ctx context.Context, t p.Task, tool p.Tool, b p.Release, 
 				return end("unknown", "文件已写入，运行配置尚无生效证据")
 			}
 		}
-		if (t.Action == "update" || t.Action == "install" || t.Action == "rollback") && res.Status == "succeeded" && (verified.Installed != t.Version || verified.Running != t.Version) {
+		if (t.Action == "update" || t.Action == "install" || t.Action == "rollback" || t.Action == "activate") && res.Status == "succeeded" && (verified.Installed != t.Version || verified.Running != t.Version) {
 			return end("unknown", "版本生效尚未通过读回核实")
 		}
 	}

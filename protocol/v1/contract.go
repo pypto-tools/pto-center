@@ -22,7 +22,14 @@ import (
 //go:embed tool.schema.json
 var manifestSchema []byte
 
-const MaxBundle = 8 << 20
+const (
+	MaxBundle     = 8 << 20
+	MaxTaskBytes  = 1 << 20
+	MaxReplyBytes = 512 << 10
+)
+
+// WebSocket WriteJSON appends a newline to the encoding/json document.
+func FitsFrame(raw []byte, limit int) bool { return len(raw) < limit }
 
 var Name = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
 var Version = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._+-]{0,99}$`)
@@ -212,7 +219,7 @@ type Inventory struct {
 	Presence          string   `json:"presence"`
 	Installed         string   `json:"installedVersion,omitempty"`
 	Running           string   `json:"runningVersion,omitempty"`
-	Config            Values   `json:"config,omitempty"`
+	Config            Values   `json:"config"`
 	Activation        string   `json:"activation,omitempty"`
 	SchemaVersion     int      `json:"configSchemaVersion,omitempty"`
 	WrittenRevision   int64    `json:"writtenRevision,omitempty"`

@@ -15,6 +15,8 @@ make demo
 3. 点击「查看采样窗口」，填 3 天并发布。展开逐机结果可查看返回的数据。
 4. 在一台机器上先发布 v2，再对另一台发布。选择 v1 的「回退版本」可演练回滚。示例只操作 Agent 状态目录中的演示服务。
 
+增减目标机器时，页面保留已编辑的字段并刷新各机器的当前值。发布时中心再次核对这些字段，已观察到的变化会要求重新预览。同一节点有连续写入时，中心依据前一笔的结果和回读值决定后一笔的预期值。前一笔结果不明时，重新盘点并预览。「发布记录」每页显示 200 条，使用「较早记录」可以查看大批次中其余机器的结果。
+
 ## 生成和注册工具包
 
 工具接入协议要求可信的工具仓库明确声明入口、能力与参数。打包时解析相对路径，校验清单和配置 Schema。发布者用独立的 Ed25519 私钥签署整个发布内容，包括适配器、程序版本和可选负载。中心与节点均只需发布公钥。私钥由发布者保管。
@@ -45,6 +47,8 @@ bin/pto-center register --state ./center-state --file ./demo-v1.json
 ```json
 {"status":"succeeded","summary":"盘点完成","data":{"presence":"present","installedVersion":"v1","runningVersion":"v1"}}
 ```
+
+单个任务按最终 JSON 编码限 1 MiB，回执限 512 KiB，两者均包含消息末尾换行。过大的任务会在发布时提示错误。过大的回执保留任务 ID 和执行状态，并在摘要中说明省略的详情。盘点数据也被省略时，可以重新盘点。配置基线按工具和 Schema 版本分别保存，节点报告工具已移除时会清除相应基线。
 
 `probe` 的安装状态为 `present`、`absent` 或 `unknown`。可额外报告本机支持的 `capabilities`、`writtenRevision` 和 `effectiveRevision`。`read-config` 在 `data` 返回托管字段的对象。写操作应区分 `succeeded`、`pending-activation`、`failed`、`conflict` 和 `unknown`。声明配置已生效时，Agent 还会读回所写字段并核对运行修订或显式的 `activation: effective` 运行证据。
 
