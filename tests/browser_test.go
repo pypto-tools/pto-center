@@ -92,39 +92,52 @@ func TestBrowserBatchConfiguration(t *testing.T) {
 	profile := t.TempDir()
 	ctx, cancel := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(ctx, chrome, "--headless=new", "--disable-gpu", "--no-sandbox", "--disable-dev-shm-usage", "--disable-background-networking", "--remote-debugging-port=0", "--user-data-dir="+profile, "about:blank")
+	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
 		cancel()
 		t.Fatal(err)
 	}
-	defer func() { cancel(); cmd.Wait() }()
-	var targets []struct {
-		Type                 string
-		WebSocketDebuggerURL string
-	}
-	for end := time.Now().Add(12 * time.Second); time.Now().Before(end); {
+	exited := make(chan error, 1)
+	go func() { exited <- cmd.Wait(); close(exited) }()
+	defer func() { cancel(); <-exited }()
+	client := &http.Client{Timeout: 2 * time.Second}
+	var endpoint string
+	var startupErr error
+	for end := time.Now().Add(30 * time.Second); time.Now().Before(end); {
+		select {
+		case err := <-exited:
+			t.Fatalf("Chromium exited during startup: %v", err)
+		default:
+		}
 		lines, err := os.ReadFile(filepath.Join(profile, "DevToolsActivePort"))
 		if err == nil {
-			port := strings.Split(string(lines), "\n")[0]
-			res, err := http.Get("http://127.0.0.1:" + port + "/json/list")
+			port, _, _ := strings.Cut(string(lines), "\n")
+			// Explicitly create the test page once the debugger accepts HTTP.
+			req, reqErr := http.NewRequestWithContext(ctx, http.MethodPut, "http://127.0.0.1:"+port+"/json/new?about:blank", nil)
+			if reqErr != nil {
+				t.Fatal(reqErr)
+			}
+			var res *http.Response
+			res, err = client.Do(req)
 			if err == nil {
-				json.NewDecoder(res.Body).Decode(&targets)
+				var target struct{ WebSocketDebuggerURL string }
+				if res.StatusCode == http.StatusOK {
+					err = json.NewDecoder(res.Body).Decode(&target)
+				} else {
+					err = fmt.Errorf("Chrome DevTools responded %s", res.Status)
+				}
 				res.Body.Close()
-				if len(targets) > 0 {
+				if err == nil && target.WebSocketDebuggerURL != "" {
+					endpoint = target.WebSocketDebuggerURL
 					break
 				}
 			}
 		}
+		startupErr = err
 		time.Sleep(50 * time.Millisecond)
 	}
-	var endpoint string
-	for _, target := range targets {
-		if target.Type == "page" {
-			endpoint = target.WebSocketDebuggerURL
-			break
-		}
-	}
 	if endpoint == "" {
-		t.Fatal("missing browser page")
+		t.Fatalf("Chromium test page unavailable: %v", startupErr)
 	}
 	conn, _, err := websocket.DefaultDialer.Dial(endpoint, nil)
 	if err != nil {
