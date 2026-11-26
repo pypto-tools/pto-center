@@ -1,0 +1,17 @@
+{
+  "apiVersion": "pto-center/v1",
+  "id": "pto-system-doctor",
+  "source": {
+    "type": "git",
+    "repository": "pypto-tools/pto-center"
+  },
+  "adapter": "adapter.py",
+  "capabilities": [
+    "probe",
+    "read-config",
+    "validate-config",
+    "apply-config"
+  ],
+  "configSchema": "config.schema.json",
+  "configSchemaVersion": 1
+}

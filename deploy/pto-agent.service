@@ -1,0 +1,20 @@
+[Unit]
+Description=PTO Tool Agent
+After=network-online.target netbird.service
+Wants=network-online.target
+
+[Service]
+User=pto-agent
+Group=pto-agent
+EnvironmentFile=/home/pypto-tools/pto-agent/config/agent.env
+ExecStart=/home/pypto-tools/pto-agent/app/pto-agent --node ${NODE_NAME} --state /home/pypto-tools/pto-agent/state --center ${CENTER_URL} --trust /home/pypto-tools/pto-agent/config/release.pub --ca /home/pypto-tools/pto-agent/config/center-ca.pem --invite-file /home/pypto-tools/pto-agent/config/invite
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/pypto-tools/pto-agent/state
+
+[Install]
+WantedBy=multi-user.target
