@@ -49,6 +49,8 @@ func Open(dir string, key ed25519.PublicKey) (*Store, error) {
  CREATE TABLE IF NOT EXISTS agent_versions(seq INTEGER PRIMARY KEY,node TEXT NOT NULL,version TEXT NOT NULL,platform TEXT NOT NULL,seen INTEGER NOT NULL);
  CREATE INDEX IF NOT EXISTS agent_version_history ON agent_versions(node,seq);
  CREATE TABLE IF NOT EXISTS bundles(digest TEXT PRIMARY KEY, tool TEXT NOT NULL, version TEXT NOT NULL, raw BLOB NOT NULL, meta BLOB NOT NULL, UNIQUE(tool,version));
+ CREATE TABLE IF NOT EXISTS center_changes(seq INTEGER PRIMARY KEY,id TEXT NOT NULL UNIQUE,action TEXT NOT NULL,bundle TEXT NOT NULL,target TEXT NOT NULL,previous TEXT NOT NULL,state TEXT NOT NULL,summary TEXT NOT NULL DEFAULT '');
+ CREATE UNIQUE INDEX IF NOT EXISTS one_center_change ON center_changes((1)) WHERE state IN ('queued','running');
  CREATE TABLE IF NOT EXISTS inventory(node TEXT NOT NULL,tool TEXT NOT NULL,raw BLOB NOT NULL,seen INTEGER NOT NULL,PRIMARY KEY(node,tool));
  CREATE TABLE IF NOT EXISTS config_baselines(node TEXT NOT NULL,tool TEXT NOT NULL,schema_version INTEGER NOT NULL,raw BLOB NOT NULL,PRIMARY KEY(node,tool,schema_version));
  CREATE TABLE IF NOT EXISTS installed_versions(node TEXT NOT NULL,tool TEXT NOT NULL,version TEXT NOT NULL,PRIMARY KEY(node,tool));
@@ -141,7 +143,7 @@ func (s *Store) Enroll(name, invite, credential string) error {
 	return tx.Commit()
 }
 func queueProbes(tx *sql.Tx, node string) error {
-	rows, err := tx.Query("SELECT meta FROM bundles b WHERE tool<>? AND rowid=(SELECT max(rowid) FROM bundles WHERE tool=b.tool)", p.AgentTool)
+	rows, err := tx.Query("SELECT meta FROM bundles b WHERE tool NOT IN (?,?) AND rowid=(SELECT max(rowid) FROM bundles WHERE tool=b.tool)", p.AgentTool, p.CenterTool)
 	if err != nil {
 		return err
 	}
@@ -200,7 +202,7 @@ func (s *Store) register(raw []byte, source, expected *SourceRecord) (p.Tool, er
 	if err != nil {
 		return tool, err
 	}
-	if tool.Manifest.ID != p.AgentTool && len(raw) > p.MaxBundle {
+	if tool.Manifest.ID != p.AgentTool && tool.Manifest.ID != p.CenterTool && len(raw) > p.MaxBundle {
 		return tool, errors.New("bundle exceeds limit")
 	}
 	if source != nil && (!strings.EqualFold(source.Repository, tool.Manifest.Source.Repository) || (expected != nil && expected.Tool != tool.Manifest.ID)) {
@@ -253,7 +255,7 @@ func registerBundle(tx *sql.Tx, raw []byte, tool p.Tool) error {
 		return err
 	}
 	// The authenticated connection already inventories the running Agent.
-	if tool.Manifest.ID == p.AgentTool {
+	if tool.Manifest.ID == p.AgentTool || tool.Manifest.ID == p.CenterTool {
 		return nil
 	}
 	rows, err := tx.Query("SELECT name FROM nodes WHERE credential<>''")
@@ -298,7 +300,7 @@ func decodeRows[T any](rows *sql.Rows) ([]T, error) {
 	return out, rows.Err()
 }
 func (s *Store) tools() ([]p.Tool, error) {
-	rows, err := s.db.Query("SELECT meta FROM bundles ORDER BY rowid DESC")
+	rows, err := s.db.Query("SELECT meta FROM bundles WHERE tool<>? ORDER BY rowid DESC", p.CenterTool)
 	if err != nil {
 		return nil, err
 	}
@@ -496,6 +498,9 @@ func (s *Store) preview(actor string, readOnly bool, in Selection, rollout *Roll
 	}
 	if tool, err = registeredTool(tx, in.Bundle); err != nil {
 		return plan, err
+	}
+	if tool.Manifest.ID == p.CenterTool {
+		return plan, errors.New("中心版本只能在中心机上切换")
 	}
 	action, ok := tool.Manifest.Action(in.Action)
 	if !ok || in.Action == "validate-config" || readOnly && action.Effect != "read" {

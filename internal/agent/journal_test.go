@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"github.com/pypto-tools/pto-center/internal/localfiles"
 	p "github.com/pypto-tools/pto-center/protocol/v1"
 	"os"
 	"path/filepath"
@@ -26,7 +27,7 @@ func TestReplayAndInterruptedChange(t *testing.T) {
 		t.Fatal(err)
 	}
 	data, _ := json.Marshal(b)
-	if err = atomicFile(filepath.Join(a.Dir, "cache", tool.Digest+".json"), data, 0600); err != nil {
+	if err = localfiles.Replace(filepath.Join(a.Dir, "cache", tool.Digest+".json"), data, 0600); err != nil {
 		t.Fatal(err)
 	}
 	task := p.Task{ID: strings.Repeat("a", 64), Node: "test", Tool: "test", Version: "1", Bundle: tool.Digest, Action: "custom.count"}
@@ -40,7 +41,7 @@ func TestReplayAndInterruptedChange(t *testing.T) {
 	task.ID = strings.Repeat("b", 64)
 	raw, _ = json.Marshal(task)
 	data, _ = json.Marshal(journal{TaskHash: p.Hash(raw)})
-	if err = atomicFile(filepath.Join(a.Dir, "journal", task.ID+".json"), data, 0600); err != nil {
+	if err = localfiles.Replace(filepath.Join(a.Dir, "journal", task.ID+".json"), data, 0600); err != nil {
 		t.Fatal(err)
 	}
 	rep, err := a.handle(ctx, "", task, nil)
@@ -59,7 +60,7 @@ func TestReplayAndInterruptedChange(t *testing.T) {
 		task.ID = p.Hash([]byte("broken-cache-" + effect))
 		raw, _ = json.Marshal(task)
 		data, _ = json.Marshal(journal{TaskHash: p.Hash(raw), Effect: effect})
-		if err = atomicFile(filepath.Join(a.Dir, "journal", task.ID+".json"), data, 0600); err != nil {
+		if err = localfiles.Replace(filepath.Join(a.Dir, "journal", task.ID+".json"), data, 0600); err != nil {
 			t.Fatal(err)
 		}
 		rep, err = a.handle(ctx, "", task, nil)

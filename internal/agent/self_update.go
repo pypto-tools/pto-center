@@ -8,41 +8,20 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"runtime/debug"
 
+	"github.com/pypto-tools/pto-center/internal/buildversion"
 	"github.com/pypto-tools/pto-center/internal/localfiles"
 	p "github.com/pypto-tools/pto-center/protocol/v1"
 )
 
-// BuildVersion is set by the release build with -ldflags -X.
+// BuildVersion keeps the linker flag used by earlier Agent release scripts.
 var BuildVersion string
 
 func Version() string {
 	if BuildVersion != "" {
 		return BuildVersion
 	}
-	if info, ok := debug.ReadBuildInfo(); ok {
-		if p.Version.MatchString(info.Main.Version) {
-			return info.Main.Version
-		}
-		var revision, modified string
-		for _, setting := range info.Settings {
-			switch setting.Key {
-			case "vcs.revision":
-				if len(setting.Value) >= 12 {
-					revision = setting.Value[:12]
-				}
-			case "vcs.modified":
-				if setting.Value == "true" {
-					modified = ".dirty"
-				}
-			}
-		}
-		if revision != "" {
-			return "dev-" + revision + modified
-		}
-	}
-	return "dev"
+	return buildversion.Current()
 }
 
 func (a Agent) selfInventory() p.Inventory {
@@ -91,7 +70,7 @@ func (a Agent) saveInstall(s agentInstall) error {
 	if err != nil {
 		return err
 	}
-	return atomicFile(filepath.Join(a.Dir, "agent-install.json"), b, 0600)
+	return localfiles.Replace(filepath.Join(a.Dir, "agent-install.json"), b, 0600)
 }
 
 func (a Agent) handleSelf(ctx context.Context, key string, t p.Task, path string, j journal, started bool, emit func(p.Result) error) (p.Reply, error) {
@@ -149,7 +128,7 @@ func (a Agent) handleSelf(ctx context.Context, key string, t p.Task, path string
 	if err != nil {
 		return p.Reply{}, err
 	}
-	if err := atomicFile(path, b, 0600); err != nil {
+	if err := localfiles.Replace(path, b, 0600); err != nil {
 		return p.Reply{}, err
 	}
 	s.Trial = &agentTrial{Task: t.ID, Bundle: t.Bundle, Version: t.Version}
@@ -190,7 +169,7 @@ func (a Agent) executable(digest string) (string, error) {
 		return "", err
 	}
 	path := filepath.Join(a.Dir, "agent-worker")
-	if err := atomicFile(path, image, 0700); err != nil {
+	if err := localfiles.Replace(path, image, 0700); err != nil {
 		return "", err
 	}
 	return path, nil

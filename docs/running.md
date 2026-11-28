@@ -64,6 +64,43 @@ GitHub 同步只跟踪已登记的仓库和文件。注册后，支持 `install`
 
 每个工具的版本号唯一绑定到已签名内容。适配器或负载有变化时应使用新的版本号。普通工具的单个已签名 JSON 包上限为 8 MiB，适合脚本和小型发布包。Agent 发布包支持多架构，整个包上限为 32 MiB。
 
+### 平台首装和网页升级
+
+官方发行版同时提供 Linux amd64 和 arm64 首装归档，以及可直接在网页登记的 `pto-center-<版本>.json` 和 `pto-agent-<版本>.json`。每个 JSON 都含两个架构。新部署从对应架构的归档取出所需的可执行文件与 systemd 单元，按下文配置 NetBird、TLS 和账号。两个组件可以同时准备。先启动 Center，再让 Agent 接入。[平台发行版](https://github.com/pypto-tools/pto-center/releases) · [NetBird 部署](#netbird-部署)
+
+首次安装时下载同一版的两个压缩包、两个 JSON、`release.pub`、`release.pem`、`SHA256SUMS` 和 `SHA256SUMS.sig` 到独立目录。先用可信渠道取得的指纹核对 OpenSSL 公钥，再验签和校验文件。首个正式发布者的 PEM 文件 SHA-256 如下。[部署用 Ed25519 公钥](../deploy/release.pub)
+
+```sh
+echo 'b478b3f94184c63e488b806c57dc589a40b8c125e83c34b9d82df4bacd04dfc6  release.pem' | sha256sum -c -
+openssl pkeyutl -verify -pubin -inkey release.pem -rawin -in SHA256SUMS -sigfile SHA256SUMS.sig
+sha256sum -c SHA256SUMS
+tar -xzf pto-center-v0.1.0-linux-amd64.tar.gz   # arm64 机器选 linux-arm64
+```
+
+1. 新部署使用核验过的 `release.pub` 初始化 Center，并将同一文件放入 Agent 的信任配置。v1 的每套部署信任一把发布公钥，业务工具也须由该部署信任的发布者签名。沿用其他公钥的已有部署可用自己的发布密钥重新封装平台产物。
+2. 新版本发布后，在「工具与配置 → 中心版本」点「同步官方版本」。Center 从最新正式 GitHub Release 取两个签名包装入本地目录，校验组件、标签和签名，两个均通过才登记。无法直连 GitHub 的中心可在同页点「注册发布包」分别上传文件。登记完成后由管理员选择升级时间。
+3. 选择本机架构支持的版本并点「更新中心」。网页请求只包含目标包摘要和当前运行版本。中心机上的独立执行器验签，从已有状态目录启动候选进程，待数据库可用、管理和节点监听均已就绪，并核实候选进程上报的版本后确认。切换期间连接会短暂中断，Agent 自动重连。刷新页面可看到结果，也可用有权限的只读账号访问 `GET /api/version` 读取实际运行版本、平台和协议。
+4. 候选版本无法启动、上报版本不符、试运行超时（默认 90 秒）或试运行期间断电，执行器使用上次确认的版本恢复。已切换的进程意外退出时，执行器启动前一个已确认版本，成功后将故障版本记为失败。重启时，执行器最多尝试三次启动已确认版本，然后尝试其前一个版本或最初安装的程序。若两者都无法启动，执行器报告错误，由 systemd 按单元策略重启。要主动回退，在同一面板选择已注册的旧签名包，点「回退到所选版本」。数据库、凭据和配置一直使用原目录。发版应确保数据库变更兼容需要回退到的版本。基础执行器的 `--version` 显示其自身的版本。
+5. Center 验收后，在「工具与配置」选择 `pto-agent` 更新单台，或在「分批发布」按组选试点和后续主机，核对新版重连后再推广。[Agent 分批升级](#管理-agent-自身的版本)
+
+从早于 v0.1.0 的 Center 接入时，需在中心机上完成一次受信首装包的二进制替换并重启原单元。原有 `pto-center serve` 入口会启动独立执行器。已有中心保留原状态目录和信任配置。
+
+### 发布新的平台版本
+
+将已通过 CI 的提交打上新标签（如 `v0.1.0`）并推送。仓库的 `Build platform release` 工作流分别在原生 amd64、arm64 Linux 上构建可执行文件，核对两个程序的 `--version` 并用实际 Center 初始化 SQLite。构建机只需源码读取权限。本地原生构建的入口为 `bash scripts/build-release.sh <版本> <输出目录>`。
+
+在持有发布密钥的机器上检出标签对应的同一提交，用 GitHub CLI 下载该标签的成功构建。将命令中的工作流运行 ID 和发布者目录换为实际值。发布者目录内需有相配的 `signing.key` 与 `release.pub`。
+
+```sh
+version=v0.1.0
+gh run download <运行ID> -D "dist/builds-$version"
+make build
+python3 scripts/package-release.py --version "$version" --artifacts "dist/builds-$version" \
+  --publisher <发布者目录> --out "dist/$version"
+```
+
+打包脚本核对源码提交、版本、架构和文件摘要，签出两个原生升级包，在临时 Center 注册验签，并为首装归档生成可由 OpenSSL 校验的脱机签名。将输出目录中的所有文件附到相同标签的 GitHub Release，使用草稿核对附件后发布。后续同步只读取正式 Release。
+
 ### 管理 Agent 自身的版本
 
 先更新中心，再在每台机器部署一次支持托管升级的 `pto-agent` 基础版。沿用原节点名、凭据和状态目录。systemd 的 `ExecStart` 指向 `app/pto-agent`，它以服务账号启动工作进程。后续下载、试运行和回退使用可写且可执行的 `state/`。支持托管升级的基础版完成认证并上报实际运行版本及 Linux 架构后，管理员即可从中心发起后续升级。旧节点尚未报告版本时，主机清单显示「未上报」。
