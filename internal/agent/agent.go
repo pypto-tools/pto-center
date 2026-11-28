@@ -241,7 +241,10 @@ func (a Agent) connect(ctx context.Context, key string) error {
 		trialID = ""
 		report := func(event p.Result) error {
 			ws.SetWriteDeadline(time.Now().Add(15 * time.Second))
-			return ws.WriteJSON(boundedReply(p.Reply{ID: task.ID, Result: event}))
+			// A lost progress frame must not interrupt a local write. The journaled
+			// final receipt carries all observed install phases on reconnection.
+			_ = ws.WriteJSON(boundedReply(p.Reply{ID: task.ID, Result: event}))
+			return nil
 		}
 		reply, err := a.handle(ctx, key, task, report)
 		if err != nil {
@@ -320,7 +323,10 @@ func boundedReply(reply p.Reply) p.Reply {
 	if fits() {
 		return reply
 	}
-	reply.Result = p.Result{Status: reply.Result.Status, Summary: "回执超出传输上限，已省略结果详情"}
+	if !reply.Result.Phases.Valid() {
+		reply.Result.Phases = nil
+	}
+	reply.Result = p.Result{Status: reply.Result.Status, Phases: reply.Result.Phases, Summary: "回执超出传输上限，已省略结果详情"}
 	if !fits() {
 		reply.Inventory = nil
 		reply.Result.Summary = "回执超出传输上限，已省略盘点和结果详情，请重新盘点"
@@ -458,9 +464,15 @@ func (r adapter) call(ctx context.Context, t p.Task, emit func(p.Result) error) 
 			err = errors.New("invalid adapter output")
 			break
 		}
+		if t.Action != "install" && len(event.Phases) != 0 {
+			err = errors.New("仅安装动作可上报安装阶段")
+			break
+		}
 		if event.Status == "progress" {
 			if emit != nil {
-				_ = emit(event)
+				if err = emit(event); err != nil {
+					break
+				}
 			}
 			continue
 		}
@@ -503,6 +515,9 @@ func (r adapter) observe(ctx context.Context, t p.Task, tool p.Tool) (p.Inventor
 		return o, err
 	}
 	if result.Status != "succeeded" {
+		if result.Summary != "" {
+			return o, fmt.Errorf("probe failed: %s", result.Summary)
+		}
 		return o, errors.New("probe failed")
 	}
 	raw, _ := json.Marshal(result.Data)
@@ -561,6 +576,9 @@ func (a Agent) execute(ctx context.Context, t p.Task, tool p.Tool, b p.Release, 
 	}
 	o, err := run.observe(ctx, t, tool)
 	reply.Inventory = &o
+	if t.Action == "install" {
+		return run.install(ctx, t, tool, o, err, emit)
+	}
 	if t.Action == "probe" || t.Action == "read-config" {
 		if err != nil {
 			return end("failed", err.Error())
@@ -575,11 +593,8 @@ func (a Agent) execute(ctx context.Context, t p.Task, tool p.Tool, b p.Release, 
 	if o.Presence == "unknown" {
 		return end("unknown", "无法判定本机安装状态")
 	}
-	if o.Presence == "absent" && t.Action != "install" {
+	if o.Presence == "absent" {
 		return end("skipped", "未安装")
-	}
-	if t.Action == "install" && o.Presence == "present" {
-		return end("skipped", "已安装")
 	}
 	if t.Action == "activate" && o.Installed != "" && o.Installed != t.Version {
 		return end("conflict", "本机已安装版本与激活目标不符")
@@ -672,7 +687,7 @@ func (a Agent) execute(ctx context.Context, t p.Task, tool p.Tool, b p.Release, 
 				return end("unknown", "文件已写入，运行配置尚无生效证据")
 			}
 		}
-		if (t.Action == "update" || t.Action == "install" || t.Action == "rollback" || t.Action == "activate") && res.Status == "succeeded" && (verified.Installed != t.Version || verified.Running != t.Version) {
+		if (t.Action == "update" || t.Action == "rollback" || t.Action == "activate") && res.Status == "succeeded" && (verified.Installed != t.Version || verified.Running != t.Version) {
 			return end("unknown", "版本生效尚未通过读回核实")
 		}
 	}

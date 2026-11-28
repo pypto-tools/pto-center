@@ -80,7 +80,13 @@ function createWorkflowPage() {
       else if (r.verified) status = badge(r.state === 'skipped' ? '原已安装' : '已安装', 'ok');
       else if (r.state === 'succeeded' || r.state === 'skipped') status = badge(config ? '配置待核对' : '版本待核对', 'wait');
       else status = badge(statuses[r.state] || r.state, taskTones[r.state]);
-      return [String(i + 1) + (config ? ' · 配置' : ' · 安装'), stack(step.tool, step.version), status, r?.summary || '—'];
+      let receipt = r?.summary || '—';
+      if (r && !config) {
+        receipt = make('div');
+        if (r.summary) receipt.append(make('span', r.summary));
+        receipt.append(installPhaseList(r.phases, active.includes(r.state)));
+      }
+      return [String(i + 1) + (config ? ' · 配置' : ' · 安装'), stack(step.tool, step.version), status, receipt];
     }
     const rows = [];
     let verified = 0;

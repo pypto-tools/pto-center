@@ -319,9 +319,10 @@ type Inventory struct {
 	Capabilities      []string `json:"capabilities,omitempty"`
 }
 type Result struct {
-	Status  string `json:"status"`
-	Summary string `json:"summary,omitempty"`
-	Data    any    `json:"data,omitempty"`
+	Status  string        `json:"status"`
+	Summary string        `json:"summary,omitempty"`
+	Data    any           `json:"data,omitempty"`
+	Phases  InstallPhases `json:"phases,omitempty"`
 }
 
 func (o Inventory) HasConfig(values Values) bool {

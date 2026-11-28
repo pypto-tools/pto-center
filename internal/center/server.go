@@ -598,11 +598,7 @@ func (s *Server) servePeer(w http.ResponseWriter, r *http.Request, node string) 
 				return
 			}
 			if reply.Result.Status == "progress" {
-				raw, err := json.Marshal(reply.Result)
-				if err != nil {
-					return
-				}
-				if _, err = s.Store.db.Exec("UPDATE tasks SET result=? WHERE id=?", raw, active.ID); err != nil {
+				if err := s.Store.progress(*active, reply.Result); err != nil {
 					return
 				}
 				continue

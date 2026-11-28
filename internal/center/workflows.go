@@ -64,13 +64,14 @@ type WorkflowCatalog struct {
 }
 
 type WorkflowReceipt struct {
-	Node     string `json:"node"`
-	Step     int    `json:"step"`
-	Action   string `json:"action"`
-	Task     string `json:"task"`
-	State    string `json:"state"`
-	Verified bool   `json:"verified"`
-	Summary  string `json:"summary"`
+	Node     string          `json:"node"`
+	Step     int             `json:"step"`
+	Action   string          `json:"action"`
+	Task     string          `json:"task"`
+	State    string          `json:"state"`
+	Verified bool            `json:"verified"`
+	Summary  string          `json:"summary"`
+	Phases   p.InstallPhases `json:"phases,omitempty"`
 }
 
 type WorkflowRun struct {
@@ -354,6 +355,15 @@ func workflowEvidence(t p.Task, r p.Reply) string {
 		}
 		return fmt.Sprintf("目标 %s，实际安装 %s，运行 %s", t.Version, label(o.Installed), label(o.Running))
 	}
+	if t.Action == "install" && len(r.Result.Phases) != 0 {
+		verification, ok := r.Result.Phases["verify"]
+		if !ok {
+			return "缺少安装验收的阶段回执"
+		}
+		if verification.State != "succeeded" {
+			return "安装验收未通过：" + verification.Summary
+		}
+	}
 	if t.Action == "apply-config" {
 		if o.SchemaVersion != t.SchemaVersion || !o.HasConfig(t.Values) {
 			return "回读配置与模板指定的字段不符"
@@ -468,7 +478,8 @@ func (s *Store) WorkflowRun(id, node string) (WorkflowRun, error) {
 	out.Node = node
 	ops := out.Workflow.operations()
 	rows, err := tx.Query(`SELECT w.node,w.step,t.action,w.task,CASE WHEN t.state='dispatched' AND json_extract(CAST(t.result AS TEXT),'$.status')='progress'
-		THEN 'progress' ELSE t.state END,w.verified,COALESCE(NULLIF(w.note,''),json_extract(CAST(t.result AS TEXT),'$.summary'),'')
+		THEN 'progress' ELSE t.state END,w.verified,COALESCE(NULLIF(w.note,''),json_extract(CAST(t.result AS TEXT),'$.summary'),''),
+		json_extract(CAST(t.result AS TEXT),'$.phases')
 		FROM workflow_tasks w JOIN tasks t ON t.id=w.task WHERE w.run=? AND w.node=? ORDER BY w.step`, id, node)
 	if err != nil {
 		return out, err
@@ -477,8 +488,17 @@ func (s *Store) WorkflowRun(id, node string) (WorkflowRun, error) {
 	for rows.Next() {
 		var rec WorkflowReceipt
 		var position int
-		if err = rows.Scan(&rec.Node, &position, &rec.Action, &rec.Task, &rec.State, &rec.Verified, &rec.Summary); err != nil {
+		var phases []byte
+		if err = rows.Scan(&rec.Node, &position, &rec.Action, &rec.Task, &rec.State, &rec.Verified, &rec.Summary, &phases); err != nil {
 			return out, err
+		}
+		if len(phases) != 0 {
+			if err := json.Unmarshal(phases, &rec.Phases); err != nil {
+				return out, err
+			}
+			if rec.State != "progress" && rec.State != "dispatched" {
+				rec.Phases.CloseRunning()
+			}
 		}
 		if position < 1 || position > len(ops) || ops[position-1].action != rec.Action {
 			return out, errors.New("invalid persisted workflow operation")

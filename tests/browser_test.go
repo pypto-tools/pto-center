@@ -448,7 +448,33 @@ func TestBrowserBatchConfiguration(t *testing.T) {
 	l.waitWorkflow(catalog.Runs[0].ID, "node-a", "skipped", "succeeded", "succeeded")
 	d.eval(`document.querySelector('#refresh').click();true`)
 	d.wait(`document.querySelector('#wf-progress').innerText.includes('2/2 步已核实') && document.querySelector('#wf-results').innerText.includes('配置已生效')`)
+	d.wait(`[...document.querySelectorAll('#wf-results .install-phases')].some(list =>
+	  ['环境检查', '执行安装', '安装验收'].every(phase => [...list.children].some(row =>
+	    row.textContent.includes(phase) && row.querySelector('.badge').textContent === '成功')))`)
 	d.eval(`document.querySelector('#wf-edit').click();true`)
 	d.wait(`document.querySelector('.wf-step-config input[aria-label="最大并发数"]').value==='12' &&
 	  document.querySelector('.wf-step-config input[aria-label="最大并发数"]').closest('.field').querySelector('input[type=checkbox]').checked`)
+
+	// A real preflight failure remains visible after a fresh load of both views.
+	blocked, _ := l.cliBundle("preflight-check", "v1", true)
+	if err := os.MkdirAll(filepath.Join(l.agents["node-a"].Dir, "tools", blocked.Manifest.ID, "program"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	var single center.Workflow
+	if code := l.request("admin", "POST", "/api/workflows", center.WorkflowDefinition{Name: "环境检查", Bundles: []string{blocked.Digest}}, &single); code != 200 {
+		t.Fatal(code)
+	}
+	run := center.WorkflowStart{RequestID: center.Token(), Workflow: single.ID, Revision: single.Revision, Nodes: []string{"node-a"}}
+	if code := l.request("admin", "POST", "/api/workflow-run", run, nil); code != 200 {
+		t.Fatal(code)
+	}
+	failed := l.waitWorkflow(run.RequestID, "node-a", "failed")
+	d.call("Page.reload", map[string]any{})
+	d.wait(`document.querySelector('#wf-results .install-phases code')?.textContent === 'install_path_conflict' &&
+	  [...document.querySelectorAll('#wf-results .install-phases .badge')].map(b=>b.textContent).join('/') === '失败/未执行/未执行'`)
+	d.eval(`location.hash='history';true`)
+	selector := fmt.Sprintf("#history-table details[data-id='%s']", failed.Receipts[0].Task)
+	d.wait(fmt.Sprintf(`!!document.querySelector(%q)`, selector))
+	d.eval(fmt.Sprintf(`document.querySelector(%q).open=true;true`, selector))
+	d.wait(fmt.Sprintf(`document.querySelector(%q).innerText.includes('安装入口已被占用')`, selector+" .install-phases"))
 }

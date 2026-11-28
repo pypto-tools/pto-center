@@ -437,6 +437,9 @@ func (s *Store) History(before int64) ([]Record, bool, error) {
 			if err = json.Unmarshal(res, &r.Result); err != nil {
 				return nil, false, err
 			}
+			if r.Result != nil && r.State != "dispatched" {
+				r.Result.Phases.CloseRunning()
+			}
 		}
 		records = append(records, r)
 	}
@@ -873,6 +876,61 @@ func dispatchBaseline(tx *sql.Tx, t *p.Task) (bool, error) {
 	}
 	return true, rows.Err()
 }
+
+// Persist a task's phases together with its visible result. The final reply
+// normally contains a full snapshot. An interrupted Agent can return only an
+// unknown final result, so retain any evidence previously received by the Center.
+func writeTaskResult(tx *sql.Tx, t p.Task, res *p.Result, state string) error {
+	if !res.Phases.Valid() || t.Action != "install" && len(res.Phases) != 0 {
+		return errors.New("invalid task phases")
+	}
+	if t.Action == "install" {
+		var previous []byte
+		if err := tx.QueryRow(`SELECT json_extract(CAST(result AS TEXT),'$.phases') FROM tasks
+			WHERE id=? AND node=? AND state='dispatched'`, t.ID, t.Node).Scan(&previous); err != nil {
+			return err
+		}
+		if len(previous) != 0 {
+			var phases p.InstallPhases
+			if err := json.Unmarshal(previous, &phases); err != nil {
+				return err
+			}
+			for name, phase := range res.Phases {
+				phases[name] = phase
+			}
+			res.Phases = phases
+		}
+		if state != "dispatched" {
+			res.Phases.CloseRunning()
+		}
+	}
+	raw, err := json.Marshal(res)
+	if err != nil {
+		return err
+	}
+	changed, err := tx.Exec("UPDATE tasks SET state=?,result=? WHERE id=? AND node=? AND state='dispatched'", state, raw, t.ID, t.Node)
+	if err != nil {
+		return err
+	}
+	n, err := changed.RowsAffected()
+	if err != nil || n != 1 {
+		return errors.New("task is no longer active")
+	}
+	return nil
+}
+
+func (s *Store) progress(t p.Task, res p.Result) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := writeTaskResult(tx, t, &res, "dispatched"); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func (s *Store) finish(t p.Task, r p.Reply) error {
 	if r.ID != t.ID || !p.Final(r.Result.Status) {
 		return errors.New("invalid task result")
@@ -893,17 +951,8 @@ func (s *Store) finish(t p.Task, r p.Reply) error {
 			r.Result = p.Result{Status: "unknown", Summary: "重新连接的 Agent 未报告目标版本"}
 		}
 	}
-	raw, err := json.Marshal(r.Result)
-	if err != nil {
+	if err = writeTaskResult(tx, t, &r.Result, r.Result.Status); err != nil {
 		return err
-	}
-	changed, err := tx.Exec("UPDATE tasks SET state=?,result=? WHERE id=? AND node=? AND state='dispatched'", r.Result.Status, raw, t.ID, t.Node)
-	if err != nil {
-		return err
-	}
-	n, err := changed.RowsAffected()
-	if err != nil || n != 1 {
-		return errors.New("task is no longer active")
 	}
 	if r.Inventory != nil {
 		if !slices.Contains([]string{"present", "absent", "unknown"}, r.Inventory.Presence) {
@@ -918,7 +967,7 @@ func (s *Store) finish(t p.Task, r p.Reply) error {
 		if err = recordBaseline(tx, t, *r.Inventory); err != nil {
 			return err
 		}
-		raw, err = json.Marshal(r.Inventory)
+		raw, err := json.Marshal(r.Inventory)
 		if err != nil {
 			return err
 		}

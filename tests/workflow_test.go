@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -118,6 +119,13 @@ func TestWorkflowSignedOrderedInstallation(t *testing.T) {
 	l.start("node-b")
 	good := l.waitWorkflow(in.RequestID, "node-a", "succeeded", "succeeded", "succeeded")
 	blocked := l.waitWorkflow(in.RequestID, "node-b", "succeeded", "failed")
+	succeeded := good.Receipts[0].Phases
+	failed := blocked.Receipts[1].Phases
+	if succeeded["preflight"].State != "succeeded" || succeeded["install"].State != "succeeded" || succeeded["verify"].State != "succeeded" ||
+		failed["preflight"].State != "failed" || failed["preflight"].Code != "install_path_conflict" ||
+		failed["install"].State != "not-run" || failed["verify"].State != "not-run" {
+		t.Fatal(succeeded, failed)
+	}
 	if blocked.Receipts[1].Verified || len(good.Workflow.Steps) != 3 || good.Workflow.Revision != 1 || good.Actor != "admin" {
 		t.Fatal(good, blocked)
 	}
@@ -136,7 +144,7 @@ func TestWorkflowSignedOrderedInstallation(t *testing.T) {
 	}
 	persisted, err := other.WorkflowRun(in.RequestID, "node-b")
 	other.Close()
-	if err != nil || !slices.Equal(persisted.Receipts, blocked.Receipts) {
+	if err != nil || !reflect.DeepEqual(persisted.Receipts, blocked.Receipts) {
 		t.Fatal(err, persisted)
 	}
 	// Rerunning a corrected host resumes through local probes. The already verified
@@ -155,6 +163,9 @@ func TestWorkflowSignedOrderedInstallation(t *testing.T) {
 	skipped := l.waitWorkflow(in.RequestID, "node-a", "skipped", "skipped")
 	fixed := l.waitWorkflow(in.RequestID, "node-b", "succeeded", "succeeded")
 	after, err := os.Stat(program("node-a", second.Manifest.ID))
+	if skipped.Receipts[1].Phases["install"].State != "skipped" || skipped.Receipts[1].Phases["verify"].State != "succeeded" {
+		t.Fatal(skipped.Receipts)
+	}
 	if err != nil || !os.SameFile(info, after) || !skipped.Receipts[0].Verified || !fixed.Receipts[1].Verified {
 		t.Fatal(err, skipped, fixed)
 	}
