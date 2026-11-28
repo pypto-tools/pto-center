@@ -136,50 +136,67 @@ func TestBrowserBatchConfiguration(t *testing.T) {
 			time.Sleep(30 * time.Millisecond)
 		}
 	}()
-	client := &http.Client{Timeout: 2 * time.Second}
-	var endpoint string
+	startup, stopStartup := context.WithTimeout(ctx, 90*time.Second)
+	defer stopStartup()
+	poll := time.NewTicker(100 * time.Millisecond)
+	defer poll.Stop()
+	var debuggerURL string
 	var startupErr error
-	for end := time.Now().Add(30 * time.Second); time.Now().Before(end); {
+	for debuggerURL == "" {
 		select {
+		case <-startup.Done():
+			t.Fatalf("Chromium debugger unavailable: %v (last probe: %v)", startup.Err(), startupErr)
 		case err := <-exited:
 			t.Fatalf("Chromium exited during startup: %v", err)
-		default:
+		case <-poll.C:
 		}
 		lines, err := os.ReadFile(filepath.Join(profile, "DevToolsActivePort"))
-		if err == nil {
-			port, _, _ := strings.Cut(string(lines), "\n")
-			// Explicitly create the test page once the debugger accepts HTTP.
-			req, reqErr := http.NewRequestWithContext(ctx, http.MethodPut, "http://127.0.0.1:"+port+"/json/new?about:blank", nil)
-			if reqErr != nil {
-				t.Fatal(reqErr)
-			}
-			var res *http.Response
-			res, err = client.Do(req)
-			if err == nil {
-				var target struct{ WebSocketDebuggerURL string }
-				if res.StatusCode == http.StatusOK {
-					err = json.NewDecoder(res.Body).Decode(&target)
-				} else {
-					err = fmt.Errorf("Chrome DevTools responded %s", res.Status)
-				}
-				res.Body.Close()
-				if err == nil && target.WebSocketDebuggerURL != "" {
-					endpoint = target.WebSocketDebuggerURL
-					break
-				}
-			}
+		if err != nil {
+			startupErr = err
+			continue
 		}
-		startupErr = err
-		time.Sleep(50 * time.Millisecond)
+		port, _, complete := strings.Cut(string(lines), "\n")
+		if !complete || port == "" {
+			continue
+		}
+		address := "http://127.0.0.1:" + port
+		probe, err := http.NewRequestWithContext(startup, http.MethodGet, address+"/json/version", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res, err := http.DefaultClient.Do(probe)
+		if err != nil {
+			startupErr = err
+			continue
+		}
+		res.Body.Close()
+		if res.StatusCode != http.StatusOK {
+			startupErr = fmt.Errorf("Chrome DevTools responded %s", res.Status)
+			continue
+		}
+		debuggerURL = address
 	}
-	if endpoint == "" {
-		t.Fatalf("Chromium test page unavailable: %v", startupErr)
-	}
-	var err error
-	conn, _, err = websocket.DefaultDialer.Dial(endpoint, nil)
+	// Creating a target is a side effect. Submit it once and allow a cold renderer to start.
+	req, err := http.NewRequestWithContext(startup, http.MethodPut, debuggerURL+"/json/new?about:blank", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("create Chromium test page: %v", err)
+	}
+	var target struct{ WebSocketDebuggerURL string }
+	err = json.NewDecoder(res.Body).Decode(&target)
+	res.Body.Close()
+	if res.StatusCode != http.StatusOK || err != nil || target.WebSocketDebuggerURL == "" {
+		t.Fatalf("invalid Chromium test page: %s, %v", res.Status, err)
+	}
+	conn, _, err = websocket.DefaultDialer.DialContext(startup, target.WebSocketDebuggerURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stopStartup()
+	poll.Stop()
 	d := devTools{t: t, conn: conn}
 	d.call("Network.enable", map[string]any{})
 	d.call("Network.setExtraHTTPHeaders", map[string]any{"headers": map[string]string{"Authorization": "Basic " + base64.StdEncoding.EncodeToString([]byte("admin:test-admin"))}})
