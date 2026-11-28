@@ -86,28 +86,28 @@ type Bundle struct {
 	Signature []byte  `json:"signature"`
 }
 type Tool struct {
-	Manifest Manifest `json:"manifest"`
-	Version  string   `json:"version"`
-	Schema   Values   `json:"schema,omitempty"`
-	Digest   string   `json:"digest"`
+	Manifest  Manifest `json:"manifest"`
+	Version   string   `json:"version"`
+	Schema    Values   `json:"schema,omitempty"`
+	Digest    string   `json:"digest"`
+	Platforms []string `json:"platforms,omitempty"`
 }
 
 func Hash(b []byte) string { h := sha256.Sum256(b); return hex.EncodeToString(h[:]) }
-func Validate(schema Values, value any) error {
+func compileSchema(schema Values) (*js.Schema, error) {
 	raw, err := json.Marshal(schema)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	c := js.NewCompiler()
 	c.LoadURL = func(string) (io.ReadCloser, error) { return nil, errors.New("external schema references are disabled") }
 	if err = c.AddResource("schema.json", bytes.NewReader(raw)); err != nil {
-		return err
+		return nil, err
 	}
-	s, err := c.Compile("schema.json")
-	if err != nil {
-		return err
-	}
-	raw, err = json.Marshal(value)
+	return c.Compile("schema.json")
+}
+func validateValue(s *js.Schema, value any) error {
+	raw, err := json.Marshal(value)
 	if err != nil {
 		return err
 	}
@@ -116,6 +116,36 @@ func Validate(schema Values, value any) error {
 		return err
 	}
 	return s.Validate(instance)
+}
+func Validate(schema Values, value any) error {
+	s, err := compileSchema(schema)
+	if err != nil {
+		return err
+	}
+	return validateValue(s, value)
+}
+
+// Workflow templates can be saved before a host exists. Validate each selected
+// field in its original schema so local references keep their meaning. The
+// complete candidate is validated again against each machine's observed values.
+func ValidateConfigPatch(schema, values Values) error {
+	s, err := compileSchema(schema)
+	if err != nil {
+		return err
+	}
+	for name, value := range values {
+		property, exists := s.Properties[name]
+		if !exists {
+			return fmt.Errorf("未声明配置字段 %q", name)
+		}
+		if err := validateValue(property, value); err != nil {
+			return fmt.Errorf("%s: %w", name, err)
+		}
+	}
+	if len(values) == len(s.Properties) {
+		return validateValue(s, values)
+	}
+	return nil
 }
 func objectSchema(s Values, actionForm bool) error {
 	rootRef := actionForm && s["$ref"] != nil
@@ -232,10 +262,24 @@ func (r Release) Inspect() (Tool, error) {
 	if err != nil {
 		return Tool{}, err
 	}
-	if len(b) > MaxBundle-1024 {
+	tool := Tool{Manifest: m, Version: r.Version, Schema: r.Schema, Digest: Hash(b)}
+	limit := MaxBundle
+	if m.ID == AgentTool {
+		limit = MaxAgentBundle
+		if !bytes.Equal(r.Adapter, []byte(agentFallback)) || m.Adapter != "builtin/agent" ||
+			m.Source.Repository != "pypto-tools/pto-center" || !slices.Equal(m.Capabilities, []string{"probe", "update", "rollback"}) ||
+			len(m.Actions) != 0 || m.ConfigSchema != "" {
+			return Tool{}, errors.New("pto-agent requires a native agent release")
+		}
+		_, tool.Platforms, err = agentArchive(r.Payload)
+		if err != nil {
+			return Tool{}, err
+		}
+	}
+	if len(b) > limit-1024 {
 		return Tool{}, errors.New("release too large")
 	}
-	return Tool{m, r.Version, r.Schema, Hash(b)}, nil
+	return tool, nil
 }
 func (b Bundle) Verify(key ed25519.PublicKey) (Tool, error) {
 	raw, err := json.Marshal(b.Release)
@@ -249,20 +293,22 @@ func (b Bundle) Verify(key ed25519.PublicKey) (Tool, error) {
 }
 
 type Task struct {
-	ID            string `json:"taskId"`
-	Node          string `json:"node"`
-	Tool          string `json:"tool"`
-	Action        string `json:"action"`
-	Bundle        string `json:"bundle"`
-	Version       string `json:"targetVersion"`
-	Params        Values `json:"params,omitempty"`
-	Expected      Values `json:"expected,omitempty"`
-	Values        Values `json:"values,omitempty"`
-	SchemaVersion int    `json:"configSchemaVersion,omitempty"`
-	Revision      int64  `json:"configRevision,omitempty"`
+	ID                   string `json:"taskId"`
+	Node                 string `json:"node"`
+	Tool                 string `json:"tool"`
+	Action               string `json:"action"`
+	Bundle               string `json:"bundle"`
+	Version              string `json:"targetVersion"`
+	Params               Values `json:"params,omitempty"`
+	Expected             Values `json:"expected,omitempty"`
+	Values               Values `json:"values,omitempty"`
+	SchemaVersion        int    `json:"configSchemaVersion,omitempty"`
+	Revision             int64  `json:"configRevision,omitempty"`
+	RequireTargetVersion bool   `json:"requireTargetVersion,omitempty"`
 }
 type Inventory struct {
 	Presence          string   `json:"presence"`
+	Platform          string   `json:"platform,omitempty"`
 	Installed         string   `json:"installedVersion,omitempty"`
 	Running           string   `json:"runningVersion,omitempty"`
 	Config            Values   `json:"config"`
@@ -277,6 +323,22 @@ type Result struct {
 	Summary string `json:"summary,omitempty"`
 	Data    any    `json:"data,omitempty"`
 }
+
+func (o Inventory) HasConfig(values Values) bool {
+	if o.Config == nil || len(values) == 0 {
+		return false
+	}
+	for key, value := range values {
+		if actual, ok := o.Config[key]; !ok || !Same(actual, value) {
+			return false
+		}
+	}
+	return true
+}
+func (o Inventory) ConfigIsEffective() bool {
+	return o.Activation == "effective" || o.WrittenRevision > 0 && o.EffectiveRevision == o.WrittenRevision && o.Activation != "pending"
+}
+
 type Reply struct {
 	ID        string     `json:"taskId"`
 	Result    Result     `json:"result"`

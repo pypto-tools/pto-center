@@ -10,66 +10,162 @@ make demo
 
 打开终端显示的环回地址，用 `admin` 和输出中指向文件的密码登录。演示启动一个中心和 `demo-a`、`demo-b` 两个独立 Agent，默认监听本机 8080 和 8081 端口。可以用 `PTO_DEMO_ADMIN_PORT` 和 `PTO_DEMO_NODE_PORT` 指定空闲端口。按 Ctrl-C 退出会清理演示进程及其独立临时目录。
 
+Control Center 使用整页点阵画布。实线表示当前在线的管理连接，虚线表示已登记、当前离线的 Agent，未接入的主机没有连线。通过顶部按连接状态、主机名或分组筛选，拖动画布平移，使用滚轮、双指或右下角按钮缩放，也可以点击「适应画布」回到全图。左上角可收起侧栏。
+
+点击中心或任一 Agent 卡片上的「详情」展开该机，点击「简约」收起。每台机器的选择会在当前浏览器中保留。详细模式显示当前登录用户数和 systemd 服务状态，点击「查看 … 项」可搜索这台机器的服务列表。「该机工具」链接会打开这台主机的工具盘点。
+
+左上角切到「工具版本」，选择工具和目标版本。节点显示最近盘点的已安装版本和运行版本，两者都匹配才计入已运行目标版本的主机数。展开卡片可看盘点时间和工具已上报的配置写入、生效修订。离线机器标记为快照。
+
+「分批发布」用于为同一个工具版本分两次执行更新。管理员点击「新建轮次」，选择发布包、第一批和第二批分组。预览固定本轮的机器名单，同时属于两组的机器只进入第一批。未接入、尚未盘点、未安装或不支持更新的机器会列出原因。确认第一批后，中心开始派发，离线 Agent 的任务进入队列。
+
+点击「第二批剩余」查看共用机器和第二批独有机器。第一批的回执需要带有目标安装版本和运行版本的证据，中心在发布第二批前还会核对最近盘点。若第一批有待激活或失败的主机，可处理该机后在「工具与配置」选择同一发布包并「刷新盘点」。卡片保留原回执，并列出后续核对任务。第一批全部核实后，管理员可预览并确认第二批。轮次、目标名单和任务关联保存在中心 SQLite 中，只读用户可查看全程。
+
+中心机直接采集自身状态。Agent 在管理连接建立后立即采样，之后每 30 秒通过独立的认证请求上报。在线人数按 Linux 的 `who /run/utmp` 登录记录去重，同一账号多个终端只计一人，仅上报总数。系统服务来自 `systemctl list-units --type=service --all`，覆盖 systemd 当前载入的服务，每项保留 unit、active 和 sub 状态。卡片优先显示失败和过渡状态，最多上报 256 项，超过时在页面标明截断。旧 Agent 或无法读取的指标显示「未知」，成功采集的零值显示为 0。中心按收到报告的时间标记快照，离线后仍可查看上次数据，在线超过 90 秒未更新会标明采样过期。
+
 1. 在「工具与配置」选择 `demo-service · v1` 和「首次安装」，勾选两台机器，预览并发布。在「发布记录」核对两条结果。
-2. 选择「下发配置」和两台机器，只勾选「最大并发数」，填 8，预览两行 `4 → 8` 再发布。配置生效后，总览可查看写入与生效修订号。
+2. 选择「下发配置」和两台机器，只勾选「最大并发数」，填 8，预览两行 `4 → 8` 再发布。配置生效后，「主机清单」可查看写入与生效修订号。
 3. 点击「查看采样窗口」，填 3 天并发布。展开逐机结果可查看返回的数据。
 4. 在一台机器上先发布 v2，再对另一台发布。选择 v1 的「回退版本」可演练回滚。示例只操作 Agent 状态目录中的演示服务。
 
 增减目标机器时，页面保留已编辑的字段并刷新各机器的当前值。发布时中心再次核对这些字段，已观察到的变化会要求重新预览。同一节点有连续写入时，中心依据前一笔的结果和回读值决定后一笔的预期值。前一笔结果不明时，重新盘点并预览。「发布记录」每页显示 200 条，使用「较早记录」可以查看大批次中其余机器的结果。
 
+## 新主机与安装工作流
+
+1. 让新服务器加入 NetBird，并安装、注册一次 `pto-agent`。「主机清单」显示已接入后即可作为安装目标，即使各工具还没有盘点记录。[首次接入一台 Agent](#首次接入一台-agent)
+2. 管理员在侧栏打开「安装工作流」。新建时点「创建工作流」，命名为「向服务器配置」。修改已有工作流时，在「工作流模板」下拉框选中它，点「编辑模板」。
+3. 在本地双节点演示中，选择 `demo-info · v1`，点「添加步骤」，选择 `demo-service · v1`。在这一步的「安装后下发配置」勾选「最大并发数」，填 `8`。只勾选要统一设置的字段，其余字段沿用各机原值。可以用「上移」「下移」连同配置一起调整顺序。点击「保存模板」会生成新的修订。
+4. 需要实际执行时，选中一台或多台主机，点击「运行工作流」。也可以从「主机清单」对应机器的「运行工作流」进入，再选模板。编辑和保存时不会向主机下发任务。
+5. 在「运行记录」选批次和主机。带配置的软件分别显示安装回执和配置回执。中心固定本次的模板修订、包摘要、字段值与主机名单。后续编辑只影响新运行。
+
+每台机器各自按顺序执行。Agent 在本机探测，缺少软件时调用该工具的 `install` 适配器。中心收到回执并核实安装版本和运行版本均为目标版本后，才给这台主机排入下一步。原已满足的步骤显示「原已安装」。遇到已有其他版本、待激活、失败或无法核实时，该机停止，后续步骤显示「未执行」。其他主机继续。已接入的离线主机在重连后领取待办。排除故障后，可只对受影响主机重新运行。
+
+带配置的步骤先核实安装，再使用该机刚回读的配置作为基线，合并所选字段并按该发布包的配置 Schema 校验。Agent 在写入前再次核对版本和字段。中心收到所选字段的读回值及生效修订或适配器的明确生效证据后，才排入下一个软件。如果工具已经安装，工作流仍会核对配置。重复运行时，值已匹配且有生效证据的配置显示「配置已满足」。
+
+中心保存签名发布包，通过已认证的 NetBird 管理连接下发任务。Agent 优先使用本机已验证的包缓存，需要时从中心的节点接口按摘要取包并验签。发布者可用 `--payload` 将程序随包分发，安装适配器从 `PTO_RELEASE_FILE` 读取。这样目标机安装包内程序时无需访问 GitHub。命令行工具的适配器可以实际运行已安装入口的 `--version` 核实生效版本。双节点演示的 `demo-info` 就采用这种方式。[安装适配器示例](../examples/demo-info/adapter.py)
+
+模板编辑器仅列出声明了 `install` 的签名发布版本。生产工具要先提供适合其主机权限和安装布局的适配器。[首批工具及其支持的操作](#首批工具)
+
+若一台机器已有其他版本，可在「工具与配置」选择目标发布包，按工具支持的「更新版本」或「回退版本」完成切换。遇到「待激活」时，按工具约定使服务加载配置或通过「激活版本」执行，再「刷新盘点」。确认版本与配置后，只选这台机器重新运行模板即可。
+
 ## 生成和注册工具包
 
-工具接入协议要求可信的工具仓库明确声明入口、能力与参数。打包时解析相对路径，校验清单和配置 Schema。发布者用独立的 Ed25519 私钥签署整个发布内容，包括适配器、程序版本和可选负载。中心与节点均只需发布公钥。私钥由发布者保管。
+Center 的工具列表来自**已注册的签名发布包**。每个包固定清单、版本、适配器、可选配置 Schema 和负载。发布者用独立的 Ed25519 私钥签名，Center 和 Agent 使用对应公钥验签。工具维护者可用仓库内的示例实际跑一遍 `validate`、`pack` 和 `register`。[打包并注册示例版本](tool-integration.md#打包并注册示例版本)
+
+管理员在「工具与配置 → 注册发布包」选择一种来源。
+
+| 来源 | 填写内容 | 后续版本怎样进入中心 |
+|---|---|---|
+| 本地文件 | 选择 `pack` 生成的签名 JSON，点击「注册文件」。在中心机也可用 `pto-center register --state <中心状态目录> --file <签名包>`。 | 每次注册一个版本。 |
+| GitHub | 填 `owner/repository`、40 位小写十六进制提交 ID，以及该提交中**签名 JSON** 的仓库相对路径，点击「从 GitHub 导入」。清单的 `source.repository` 须与此仓库匹配。 | Center 每 15 分钟检查默认分支中这个文件的最新提交，也可点击「同步仓库版本」。发布者把签好的新版本提交到同一路径即可。 |
+
+GitHub 同步只跟踪已登记的仓库和文件。注册后，支持 `install` 的版本出现在工作流的选项里，实际安装或更新由管理员发起。私有仓库可在启动中心时用 `--github-token-file` 指定具有必要内容读取权限的凭据文件。
+
+每个工具的版本号唯一绑定到已签名内容。适配器或负载有变化时应使用新的版本号。普通工具的单个已签名 JSON 包上限为 8 MiB，适合脚本和小型发布包。Agent 发布包支持多架构，整个包上限为 32 MiB。
+
+### 管理 Agent 自身的版本
+
+先更新中心，再在每台机器部署一次支持托管升级的 `pto-agent` 基础版。沿用原节点名、凭据和状态目录。systemd 的 `ExecStart` 指向 `app/pto-agent`，它以服务账号启动工作进程。后续下载、试运行和回退使用可写且可执行的 `state/`。支持托管升级的基础版完成认证并上报实际运行版本及 Linux 架构后，管理员即可从中心发起后续升级。旧节点尚未报告版本时，主机清单显示「未上报」。
+
+发布时给二进制嵌入与发行包一致的版本号。下面在仓库根目录构建两种架构，并用已有的发布者私钥打成一个包。将 `--signing-key` 换成发布者私钥的实际路径。
 
 ```sh
-make build
-umask 077
-bin/pto-center keygen --dir ./publisher
-bin/pto-center validate --dir examples/demo --version v1
-bin/pto-center pack --dir examples/demo --version v1 \
-  --signing-key ./publisher/signing.key --out ./demo-v1.json
-bin/pto-center init --state ./center-state --trust ./publisher/release.pub
-bin/pto-center register --state ./center-state --file ./demo-v1.json
+version=v1.2.0
+mkdir -p dist
+for arch in amd64 arm64; do
+  CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath \
+    -ldflags "-s -w -X github.com/pypto-tools/pto-center/internal/agent.BuildVersion=$version" \
+    -o "dist/pto-agent-$arch" ./cmd/pto-agent
+done
+bin/pto-center pack-agent --version "$version" \
+  --binary dist/pto-agent-amd64 --binary dist/pto-agent-arm64 \
+  --signing-key ./publisher/signing.key --out "dist/pto-agent-$version.json"
 ```
 
-网页「注册发布包」也支持上传该 JSON，或填写 GitHub 仓库、完整提交和**已签名包**的相对路径。通过 GitHub 导入后，中心每 15 分钟检查该包在默认分支的最新提交。也可以点「同步仓库版本」。新候选可选后仍由管理员决定安装或更新。私有仓库可在启动中心时用 `--github-token-file` 指定具有必要内容读取权限的凭据文件。
+在网页「注册发布包」上传签名 JSON。通过「工具与配置 → pto-agent → 更新版本」选择一台或多台机器，或在「分批发布」按组预览、确认。中心在发布和派发时都核对平台和本机升级能力。新版进程用原凭据重连并领取同一任务、报告目标版本后，中心才记为成功。启动失败、版本不符、试运行期间断电，或在 `--upgrade-timeout`（默认 90 秒）内未能确认时，启动器会恢复上次确认的版本。恢复连接后，原任务会记录失败原因。需要主动回退时，选择已注册的旧版本并执行「回退版本」。
 
-每个工具的版本号唯一绑定到已签名内容。适配器或负载有变化时应使用新的版本号。首版的单个已签名 JSON 包上限为 8 MiB，适合脚本和小型发布包。大型工具链的独立制品缓存、分块下载以及多架构制品选择仍待实现。
+在「主机清单」点击 `pto-agent` 列的版本号，可看最近 100 条版本或架构变化及观察时间。相同版本和平台的重连只刷新盘点时间。离线主机保留最后上报值。运行 `pto-agent --version` 会打印所调用文件的构建版本，`app/pto-agent` 是基础启动器，中心显示当前工作进程上报的版本。
 
 ### 适配器接口
 
-[注册清单 Schema](../protocol/v1/tool.schema.json) 是可执行的协议定义。[演示适配器](../examples/demo/adapter.py) 包含从安装、配置到回滚的例子。配置和动作参数的根 Schema 应是 `additionalProperties: false` 的对象。使用本地定义和引用，Agent 进行校验时无需联网。
-
-自定义动作的整个参数对象可以通过顶层 `$ref` 指向本地定义。把 `properties`、`required` 和 `additionalProperties: false` 一起放在被引用的对象里。中心在注册时检查字段与封闭对象的定义是否兼容，页面根据该定义生成表单，中心和 Agent 都按原始 Schema 校验参数。[示例动作清单](../examples/demo/pto-tool.json) · [JSON Schema 的封闭对象规则](https://json-schema.org/understanding-json-schema/reference/object#extending-closed-schemas)
-
-每次调用从 stdin 读取一个 JSON 对象。`taskId`、`tool`、`action`、`targetVersion` 和 `bundle` 标识已固定的任务与发布版本。自定义参数在 `params`，配置写入在 `values`，预览时已有的字段在 `expected`，缺失的键表示当时尚未设置。`validate-config` 接收完整候选配置，`apply-config` 只接收所选字段。适配器应在自己的本机写锁内再次核对基线，保存未托管字段及文件权限。
-
-适配器的当前目录和环境变量 `PTO_TOOL_DIR` 指向该工具在 Agent 下的私有状态目录。`PTO_RELEASE_FILE` 指向用 `pack --payload` 打包并校验的负载。动作来自注册清单，动态参数只作为 JSON 数据传递。stdout 每行一个 JSON 事件，可以先输出 `progress`，最后输出一个结果。`summary` 和 `data` 都会出现在网页和执行记录中，只返回适合管理员查看的数据。
-
-```json
-{"status":"succeeded","summary":"盘点完成","data":{"presence":"present","installedVersion":"v1","runningVersion":"v1"}}
-```
+工具维护者按清单声明的动作实现一个可执行入口，通过 stdin 接收任务，通过 stdout 回报结果。[请求字段、盘点返回值和配置生效约定](tool-integration.md#适配器接口)
 
 单个任务按最终 JSON 编码限 1 MiB，回执限 512 KiB，两者均包含消息末尾换行。过大的任务会在发布时提示错误。过大的回执保留任务 ID 和执行状态，并在摘要中说明省略的详情。盘点数据也被省略时，可以重新盘点。配置基线按工具和 Schema 版本分别保存，节点报告工具已移除时会清除相应基线。
 
-`probe` 的安装状态为 `present`、`absent` 或 `unknown`。可额外报告本机支持的 `capabilities`、`writtenRevision` 和 `effectiveRevision`。`read-config` 在 `data` 返回托管字段的对象。写操作应区分 `succeeded`、`pending-activation`、`failed`、`conflict` 和 `unknown`。声明配置已生效时，Agent 还会读回所写字段并核对运行修订或显式的 `activation: effective` 运行证据。
-
 ## NetBird 部署
 
-中心宿主机也需要加入 NetBird。准备一张可验证其内网名称或地址的 TLS 证书。选用该机 NetBird 接口的实际地址与两个独立端口。生产模式会核对接口地址并将监听 socket 绑定到指定接口。`--local` 只允许环回地址。NetBird 放行规则、主机防火墙与公网代理路由按[设计方案](design.md)配置。
+中心宿主机也要加入 NetBird。在该机的 NetBird 接口上选两个端口，管理端口开放给管理员设备，节点端口开放给受管服务器。生产模式会核对 IP 归属，并将监听 socket 绑定到指定接口。`--local` 只用于环回演示。验收时从获准设备、其他 peer 和网外分别检查两个端口。[访问策略与网络验收](design.md#部署和访问)
 
-建议使用组织约定的 `/home/pypto-tools/<名称>/{app,config,state,logs,tmp}`。将二进制放在 `app/`，由对应服务账号拥有私有 `state/`。只给中心安装发布公钥和 TLS 服务端凭据。初始化产生 `admin.token` 与 `viewer.token`，分别对应管理员和只读账号。只读账号可运行工具声明的只读查询。
+### 启动中心
 
-- [中心 systemd 单元](../deploy/pto-center.service) 读取 `config/center.env` 中的 `ADMIN_LISTEN`、`NODE_LISTEN`、`NETBIRD_INTERFACE`、`TLS_CERT`、`TLS_KEY`。单元使用 `CAP_NET_RAW` 将监听限定到接口。
-- 通过网页「注册节点」或 `pto-center invite --state <中心状态目录> --node <节点名> --group <组名>` 生成一次性注册码。将注册码、发布公钥和中心 TLS CA 文件交给目标 Agent，避免把凭据写入命令历史或 Git。
-- [Agent systemd 单元](../deploy/pto-agent.service) 读取 `config/agent.env` 中的 `NODE_NAME` 和 `CENTER_URL`。初次注册由节点先持久化自己的凭据，断线重试可恢复。注册完成后，重启可省略 `--invite-file`。需要回收某台身份时使用 `pto-center revoke --state <中心状态目录> --node <节点名>`。
-- Agent 使用普通账号。发布包由可信发布者审核，适配器继承 Agent 的系统权限。样例单元只允许写 Agent 状态目录，生产工具的特定写入按该工具的本机权限单独配置。
+从仓库根目录运行 `make build` 可生成本机架构的 `bin/pto-center` 和 `bin/pto-agent`。首次部署时，发布者在自己的私有目录用 `bin/pto-center keygen --dir <密钥目录>` 生成密钥对，将 `release.pub` 分给中心和各 Agent，自己保管 `signing.key`。
+
+准备 `pto-center` 服务账号和 `/home/pypto-tools/pto-center/{app,config,state}`，让该账号拥有模式为 `0700` 的 `state/`。将中心二进制放在 `app/pto-center`，发布公钥放在 `config/release.pub`，TLS 证书与私钥放在 `config/` 并允许服务账号读取。下面的 `config/center.env` 使用示例 IP 和端口，请替换为中心机实际 NetBird 接口和地址。证书须覆盖浏览器和 Agent 连接时使用的名称或 IP。
+
+```ini
+ADMIN_LISTEN=100.64.0.10:8080
+NODE_LISTEN=100.64.0.10:8081
+NETBIRD_INTERFACE=wt0
+TLS_CERT=/home/pypto-tools/pto-center/config/center.crt
+TLS_KEY=/home/pypto-tools/pto-center/config/center.key
+```
+
+在新中心上以服务账号初始化一次，再安装仓库提供的 systemd 单元。已有中心升级时沿用原状态目录。单元用 `CAP_NET_RAW` 将监听限定到接口。[中心 systemd 单元](../deploy/pto-center.service)
+
+```sh
+sudo -u pto-center /home/pypto-tools/pto-center/app/pto-center init \
+  --state /home/pypto-tools/pto-center/state \
+  --trust /home/pypto-tools/pto-center/config/release.pub
+sudo install -m 0644 deploy/pto-center.service /etc/systemd/system/pto-center.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now pto-center.service
+```
+
+从获准的 NetBird 设备打开管理端口（示例为 `https://100.64.0.10:8080`）。网页账号 `admin`、`viewer` 的密码分别保存在 `state/admin.token` 和 `state/viewer.token`。只读账号可查看状态和运行工具声明的只读查询。
+
+### 首次接入一台 Agent
+
+1. 在中心网页打开「主机清单 → 注册节点」，填写节点名，例如 `ci-test-01`，按需加入 `CI`、`User` 等组，生成一次性注册码。也可在中心机用 `pto-center invite --state <中心状态目录> --node ci-test-01 --group CI --group User` 生成。将注册码单独交给目标机。
+2. 在目标机准备 `pto-agent` 普通服务账号和 `/home/pypto-tools/pto-agent/{app,config,state}`。把匹配该机 Linux 架构的基础程序放入 `app/pto-agent`。将注册码写入 `config/invite`，发布公钥放入 `config/release.pub`，签发中心 TLS 证书的 CA 放入 `config/center-ca.pem`。服务账号需要能读取这三个文件，并拥有可写、允许执行、模式为 `0700` 的 `state/`。
+3. 在 `config/agent.env` 填入与注册码一致的节点名和中心的 **HTTPS 节点地址**。下面的配置对应上文示例。
+
+```ini
+NODE_NAME=ci-test-01
+CENTER_URL=https://100.64.0.10:8081
+```
+
+在目标机安装并启动 Agent 单元。首次启动会将节点凭据持久化，之后用原状态目录重连。[Agent systemd 单元](../deploy/pto-agent.service)
+
+```sh
+sudo install -m 0644 deploy/pto-agent.service /etc/systemd/system/pto-agent.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now pto-agent.service
+```
+
+在「主机清单」确认该机在线并检查上报的 Agent 版本，点击版本号可看变更历史。如果仍显示「未接入」，在目标机用 `journalctl -u pto-agent.service -n 50` 核对节点端口、证书、节点名和注册码。注册后重启可省略 `--invite-file`。回收节点身份可用 `pto-center revoke --state <中心状态目录> --node <节点名>`。
+
+同一台主机可以同时属于 `CI` 和 `User`。管理员在「主机清单 → 编辑分组」中调整成员关系。「工具与配置」的「全选筛选结果」按节点名去重。在 Control Center 创建先 `CI` 后 `User` 的分批发布轮次时，共用机器只进入第一批。
+
+示例单元只允许 Agent 写自己的状态目录。业务工具如果需要修改其原生配置目录，还要为该路径配置服务账号的文件权限及对应的 systemd 写入范围。
 
 ## 首批工具
 
-| 工具 | 现有能力 | 验收边界 |
-|---|---|---|
-| [pto-system-doctor](../integrations/pto-system-doctor/pto-tool.json) | 识别标准安装，读取并按字段更新 `resource-guard.conf` 中的健康轮询间隔与告警冷却时间。 | 写入保留其他字段、注释及权限，并报告待激活。默认服务单元需按站点策略赋予相应权限后才能写入。 |
-| [npu-taskqueue](../integrations/npu-taskqueue/pto-tool.json) | 识别标准安装和发布标记，通过原生 `task-submit` 提供队列摘要、使用统计按钮。 | 现有更新器要求 root 管理的路径、更新预约和空闲队列。生产发布入口的接管需在指定试点验证。 |
+下表列出本仓库可打包的适配器。已部署中心的实际列表取决于管理员注册了哪些版本。
 
-两个适配器目前随中心仓库提供，可用 `validate`、`pack` 按上文流程接入。其固定原生入口与上游标准安装布局对应，临时目录用例见 [试点测试](../tests/test_pilot_adapters.py)。真实 NetBird 策略验证、生产队列等待与既有 timer 切换按[试点 issue](https://github.com/pypto-tools/pto-center/issues/1)逐机记录。
+| 工具 | 可加入安装工作流 | 此版本可执行的操作 |
+|---|---|---|
+| `demo-info`（示例） | 可以 | 安装包内 CLI，并从实际入口读取版本。[清单](../examples/demo-info/pto-tool.json) |
+| `demo-service`（示例） | 可以，可预填配置 | 在 Agent 状态目录中演练安装、更新、激活、回退、按字段配置和自定义动作。[清单](../examples/demo/pto-tool.json) |
+| `pto-system-doctor` | 尚缺 `install` | 识别标准安装，读取和修改 `resource-guard.conf` 中的健康轮询间隔及告警冷却时间。写入保留其他字段、注释及权限，结果为待激活。[清单](../integrations/pto-system-doctor/pto-tool.json) |
+| `npu-taskqueue` | 尚缺 `install` | 识别标准安装和发布标记，通过原生 `task-submit` 查询队列摘要、NPU 使用统计。接管更新还需对接原工具的更新预约、空闲队列和受限路径。[清单](../integrations/npu-taskqueue/pto-tool.json) |
+
+## 试点验证
+
+| 范围 | 已观察到的结果 |
+|---|---|
+| NetBird 双机安装工作流 | 目标 Agent 离线时任务进入队列。重连后依次安装 `demo-info v1` 和 `demo-service v1`，本机 CLI 和服务均报告 `v1`。原样重跑时两步均跳过。 |
+| Agent 自升级 | `linux/amd64` 和 `linux/arm64` 的试点 Agent 均从 `pilot-v1` 切到 `pilot-v2`，重新连接后中心记录了新旧版本。[自升级与失败恢复测试](../tests/agent_update_test.go) |
+| 工作流步骤配置 | 自动化测试覆盖安装后读回配置、生效后进入下一步、重跑跳过已满足字段，以及单机失败时其他机器继续执行。[工作流测试](../tests/workflow_test.go) |
+
+上述安装使用示例工具。业务适配器已有临时目录测试，真实服务的安装、升级、激活与回退仍待逐个工具验证。首个业务试点可从 `pto-system-doctor` 开始，在试点机对照网页回执与本机进程版本、实际加载的配置，再验证升级和回退。`npu-taskqueue` 还需验证有作业时等待空闲及既有更新定时器的交接。[业务适配器测试](../tests/test_pilot_adapters.py) · [试点跟踪 issue](https://github.com/pypto-tools/pto-center/issues/1)
+
+在 Linux 上运行 `make test` 可复核 Go、Python 适配器测试和前端脚本语法（需 Node.js）。要实际运行 Chromium 网页测试，用本机已安装的 Chromium 可执行文件设置 `PTO_CHROME`，例如 `PTO_CHROME=/usr/bin/chromium go test -count=1 -run '^TestBrowserBatchConfiguration$' ./tests`。

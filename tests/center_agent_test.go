@@ -26,6 +26,7 @@ import (
 type lab struct {
 	t            *testing.T
 	store        *center.Store
+	storeDir     string
 	svc          *center.Server
 	admin, nodes *httptest.Server
 	priv         ed25519.PrivateKey
@@ -39,12 +40,13 @@ func newLab(t *testing.T) *lab {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s, err := center.Open(t.TempDir(), pub)
+	storeDir := t.TempDir()
+	s, err := center.Open(storeDir, pub)
 	if err != nil {
 		t.Fatal(err)
 	}
 	svc := center.New(s, "test-admin", "test-viewer")
-	l := &lab{t: t, store: s, svc: svc, admin: httptest.NewTLSServer(svc.AdminHandler()), nodes: httptest.NewTLSServer(svc.NodeHandler()), priv: priv, agents: map[string]agent.Agent{}, stops: map[string]func(){}}
+	l := &lab{t: t, store: s, storeDir: storeDir, svc: svc, admin: httptest.NewTLSServer(svc.AdminHandler()), nodes: httptest.NewTLSServer(svc.NodeHandler()), priv: priv, agents: map[string]agent.Agent{}, stops: map[string]func(){}}
 	t.Cleanup(func() {
 		for _, stop := range l.stops {
 			stop()
@@ -325,7 +327,7 @@ func TestListenerAndRouteIsolation(t *testing.T) {
 	if err = l.store.Enroll("node", invite, key); err != nil {
 		t.Fatal(err)
 	}
-	for _, path := range []string{"/", "/api/state", "/app.js"} {
+	for _, path := range []string{"/", "/api/state", "/api/rollout", "/api/agent-versions", "/app.js", "/topology.js", "/fleet-views.js"} {
 		req, err := http.NewRequest("GET", l.nodes.URL+path, nil)
 		if err != nil {
 			t.Fatal(err)
@@ -362,5 +364,108 @@ func TestListenerAndRouteIsolation(t *testing.T) {
 	}
 	if code := l.request("wrong", "GET", "/api/state", nil, nil); code != 401 {
 		t.Fatal("admin login bypass")
+	}
+}
+
+func TestGroupManagementAPI(t *testing.T) {
+	l := newLab(t)
+	if got := l.request("admin", "POST", "/api/invite", map[string]any{"name": "shared", "groups": []string{"CI", "User", "CI"}}, nil); got != 201 {
+		t.Fatalf("multi-group invitation returned %d", got)
+	}
+	var snapshot center.State
+	if got := l.request("viewer", "GET", "/api/state", nil, &snapshot); got != 200 || len(snapshot.Nodes) != 1 ||
+		!slices.Equal(snapshot.Nodes[0].Groups, []string{"CI", "User"}) || snapshot.Nodes[0].Group != "CI" {
+		t.Fatal("group membership missing from viewer state")
+	}
+	edit := map[string]any{"name": "shared", "expectedGroups": []string{"CI", "User"}, "groups": []string{"User"}}
+	if got := l.request("viewer", "POST", "/api/node-groups", edit, nil); got != 403 {
+		t.Fatalf("viewer edit returned %d", got)
+	}
+	if got := l.request("admin", "POST", "/api/node-groups", edit, nil); got != 204 {
+		t.Fatalf("admin edit returned %d", got)
+	}
+	if got := l.request("admin", "POST", "/api/node-groups", edit, nil); got != 409 {
+		t.Fatalf("stale edit returned %d", got)
+	}
+	if got := l.request("admin", "POST", "/api/node-groups", map[string]any{"name": "shared", "expectedGroups": []string{"User"}}, nil); got != 400 {
+		t.Fatalf("missing groups returned %d", got)
+	}
+}
+
+func (l *lab) postStatus(name, body string, want int) {
+	l.t.Helper()
+	key, err := os.ReadFile(filepath.Join(l.agents[name].Dir, "credential"))
+	if err != nil {
+		l.t.Fatal(err)
+	}
+	l.reportAs(name, string(key), body, want)
+}
+
+func (l *lab) reportAs(name, key, body string, want int) {
+	l.t.Helper()
+	req, err := http.NewRequest(http.MethodPost, l.nodes.URL+"/status", strings.NewReader(body))
+	if err != nil {
+		l.t.Fatal(err)
+	}
+	req.Header.Set("X-PTO-Node", name)
+	req.Header.Set("Authorization", "Bearer "+key)
+	resp, err := l.nodes.Client().Do(req)
+	if err != nil {
+		l.t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != want {
+		l.t.Fatalf("host status returned %d, want %d", resp.StatusCode, want)
+	}
+}
+
+func TestHostStatusReporting(t *testing.T) {
+	l := newLab(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); l.svc.MonitorHost(ctx) }()
+	defer func() { cancel(); <-done }()
+	v := l.bundle("v1")
+	l.add("reporter", v)
+	l.until(func(s center.State) bool {
+		return s.CenterStatus != nil && s.CenterStatusAt > 0 && len(s.Nodes) == 1 && s.Nodes[0].Online &&
+			s.Nodes[0].Status != nil && s.Nodes[0].StatusAt > 0
+	})
+	l.stop("reporter")
+	const zero = `{"loggedInUsers":0,"services":[]}`
+	l.postStatus("reporter", zero, 204)
+	l.reportAs("reporter", center.Token(), zero, 403)
+	other, err := l.store.Invite("other", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = l.store.Enroll("other", other, center.Token()); err != nil {
+		t.Fatal(err)
+	}
+	key, err := os.ReadFile(filepath.Join(l.agents["reporter"].Dir, "credential"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.reportAs("other", string(key), zero, 403)
+	for _, bad := range []string{`null`, `{"node":"other"}`, `{"loggedInUsers":-1}`,
+		`{"services":[{"unit":"../x.service","active":"active","sub":"running"}]}`,
+		`{"servicesTruncated":true}`, strings.Repeat(" ", p.MaxHostStatusBytes+1) + zero} {
+		l.postStatus("reporter", bad, 400)
+	}
+	var state center.State
+	if code := l.request("viewer", "GET", "/api/state", nil, &state); code != 200 || len(state.Nodes) != 2 {
+		t.Fatalf("read snapshot returned %d", code)
+	}
+	n := state.Nodes[1]
+	if state.Nodes[0].Status != nil || n.Online || n.Status == nil || n.Status.LoggedInUsers == nil || *n.Status.LoggedInUsers != 0 || n.Status.Services == nil {
+		t.Fatalf("zero, unavailable and offline were not preserved: %+v", state.Nodes)
+	}
+	if err := l.store.Revoke("reporter"); err != nil {
+		t.Fatal(err)
+	}
+	l.postStatus("reporter", zero, 403)
+	after, err := l.store.State()
+	if err != nil || after.Nodes[1].Status != nil || after.Nodes[1].StatusAt != 0 {
+		t.Fatal("revoked sample retained", err)
 	}
 }

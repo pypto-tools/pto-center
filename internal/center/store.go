@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/url"
 	"path/filepath"
 	"slices"
@@ -43,6 +44,10 @@ func Open(dir string, key ed25519.PublicKey) (*Store, error) {
 	db.SetMaxOpenConns(1)
 	_, err = db.Exec(`
  CREATE TABLE IF NOT EXISTS nodes(name TEXT PRIMARY KEY, invitation TEXT NOT NULL, credential TEXT NOT NULL DEFAULT '',seen INTEGER NOT NULL DEFAULT 0,group_name TEXT NOT NULL DEFAULT '');
+ CREATE TABLE IF NOT EXISTS node_extra_groups(node TEXT NOT NULL,position INTEGER NOT NULL,label TEXT NOT NULL,PRIMARY KEY(node,position),UNIQUE(node,label));
+ CREATE TABLE IF NOT EXISTS host_status(node TEXT PRIMARY KEY,received INTEGER NOT NULL,raw BLOB NOT NULL);
+ CREATE TABLE IF NOT EXISTS agent_versions(seq INTEGER PRIMARY KEY,node TEXT NOT NULL,version TEXT NOT NULL,platform TEXT NOT NULL,seen INTEGER NOT NULL);
+ CREATE INDEX IF NOT EXISTS agent_version_history ON agent_versions(node,seq);
  CREATE TABLE IF NOT EXISTS bundles(digest TEXT PRIMARY KEY, tool TEXT NOT NULL, version TEXT NOT NULL, raw BLOB NOT NULL, meta BLOB NOT NULL, UNIQUE(tool,version));
  CREATE TABLE IF NOT EXISTS inventory(node TEXT NOT NULL,tool TEXT NOT NULL,raw BLOB NOT NULL,seen INTEGER NOT NULL,PRIMARY KEY(node,tool));
  CREATE TABLE IF NOT EXISTS config_baselines(node TEXT NOT NULL,tool TEXT NOT NULL,schema_version INTEGER NOT NULL,raw BLOB NOT NULL,PRIMARY KEY(node,tool,schema_version));
@@ -56,6 +61,12 @@ func Open(dir string, key ed25519.PublicKey) (*Store, error) {
  CREATE TABLE IF NOT EXISTS config_dependencies(task TEXT NOT NULL,field TEXT NOT NULL,predecessor TEXT NOT NULL,confirmed BLOB,PRIMARY KEY(task,field));
  CREATE INDEX IF NOT EXISTS dependency_result ON config_dependencies(predecessor);
  CREATE TABLE IF NOT EXISTS plans(id TEXT PRIMARY KEY,actor TEXT NOT NULL,raw BLOB NOT NULL,created INTEGER NOT NULL,published INTEGER NOT NULL DEFAULT 0);
+ CREATE TABLE IF NOT EXISTS rollouts(id TEXT PRIMARY KEY,bundle TEXT NOT NULL,first_group TEXT NOT NULL,next_group TEXT NOT NULL,created INTEGER NOT NULL);
+ CREATE TABLE IF NOT EXISTS rollout_members(rollout TEXT NOT NULL,node TEXT NOT NULL,stage INTEGER NOT NULL,shared INTEGER NOT NULL,excluded TEXT NOT NULL,task TEXT UNIQUE,proof TEXT,PRIMARY KEY(rollout,node));
+ CREATE INDEX IF NOT EXISTS rollout_node ON rollout_members(node,rollout);
+ CREATE TABLE IF NOT EXISTS workflows(id TEXT PRIMARY KEY,name TEXT NOT NULL UNIQUE,revision INTEGER NOT NULL,steps BLOB NOT NULL);
+ CREATE TABLE IF NOT EXISTS workflow_runs(seq INTEGER PRIMARY KEY,id TEXT NOT NULL UNIQUE,snapshot BLOB NOT NULL,nodes BLOB NOT NULL,actor TEXT NOT NULL,created INTEGER NOT NULL);
+ CREATE TABLE IF NOT EXISTS workflow_tasks(run TEXT NOT NULL,node TEXT NOT NULL,step INTEGER NOT NULL,task TEXT NOT NULL UNIQUE,verified INTEGER NOT NULL DEFAULT 0,note TEXT NOT NULL DEFAULT '',PRIMARY KEY(run,node,step));
  CREATE TABLE IF NOT EXISTS sources(repo TEXT NOT NULL,path TEXT NOT NULL,tool TEXT NOT NULL,revision TEXT NOT NULL,checked INTEGER NOT NULL,message TEXT NOT NULL,PRIMARY KEY(repo,path));
  `)
 	if err != nil {
@@ -84,6 +95,12 @@ func (s *Store) Revoke(name string) error {
 	if count == 0 {
 		return sql.ErrNoRows
 	}
+	if _, err = tx.Exec("DELETE FROM host_status WHERE node=?", name); err != nil {
+		return err
+	}
+	if _, err = tx.Exec("DELETE FROM inventory WHERE node=? AND tool=?", name, p.AgentTool); err != nil {
+		return err
+	}
 	if _, err = tx.Exec("UPDATE tasks SET state='superseded' WHERE node=? AND state='queued'", name); err != nil {
 		return err
 	}
@@ -91,14 +108,6 @@ func (s *Store) Revoke(name string) error {
 		return err
 	}
 	return tx.Commit()
-}
-func (s *Store) Invite(name, group string) (string, error) {
-	if !p.Name.MatchString(name) || len(group) > 80 {
-		return "", errors.New("invalid node name or group")
-	}
-	token := Token()
-	_, err := s.db.Exec("INSERT INTO nodes(name,invitation,group_name) VALUES(?,?,?)", name, p.Hash([]byte(token)), group)
-	return token, err
 }
 func (s *Store) Enroll(name, invite, credential string) error {
 	if !p.Name.MatchString(name) || !p.Digest.MatchString(credential) || !p.Digest.MatchString(invite) {
@@ -132,7 +141,7 @@ func (s *Store) Enroll(name, invite, credential string) error {
 	return tx.Commit()
 }
 func queueProbes(tx *sql.Tx, node string) error {
-	rows, err := tx.Query("SELECT meta FROM bundles b WHERE rowid=(SELECT max(rowid) FROM bundles WHERE tool=b.tool)")
+	rows, err := tx.Query("SELECT meta FROM bundles b WHERE tool<>? AND rowid=(SELECT max(rowid) FROM bundles WHERE tool=b.tool)", p.AgentTool)
 	if err != nil {
 		return err
 	}
@@ -154,6 +163,25 @@ func (s *Store) Auth(node, key string) bool {
 	}
 	return s.db.QueryRow("SELECT credential FROM nodes WHERE name=?", node).Scan(&hash) == nil && equal(hash, p.Hash([]byte(key)))
 }
+func (s *Store) saveHostStatus(node, key string, status p.HostStatus) error {
+	raw, err := json.Marshal(status)
+	if err != nil {
+		return err
+	}
+	// Checking the credential in the write also covers a concurrent revocation.
+	result, err := s.db.Exec(`INSERT INTO host_status(node,received,raw)
+		SELECT name,?,? FROM nodes WHERE name=? AND credential=?
+		ON CONFLICT(node) DO UPDATE SET received=excluded.received,raw=excluded.raw`,
+		time.Now().Unix(), raw, node, p.Hash([]byte(key)))
+	if err != nil {
+		return err
+	}
+	count, err := result.RowsAffected()
+	if err == nil && count == 0 {
+		return sql.ErrNoRows
+	}
+	return err
+}
 func (s *Store) Register(raw []byte) (p.Tool, error) {
 	return s.register(raw, nil, nil)
 }
@@ -162,7 +190,7 @@ func (s *Store) Register(raw []byte) (p.Tool, error) {
 // inside the same transaction as bundle registration, automatic probes and import.
 func (s *Store) register(raw []byte, source, expected *SourceRecord) (p.Tool, error) {
 	var bundle p.Bundle
-	if len(raw) > p.MaxBundle {
+	if len(raw) > p.MaxAgentBundle {
 		return p.Tool{}, errors.New("bundle exceeds limit")
 	}
 	if err := json.Unmarshal(raw, &bundle); err != nil {
@@ -171,6 +199,9 @@ func (s *Store) register(raw []byte, source, expected *SourceRecord) (p.Tool, er
 	tool, err := bundle.Verify(s.key)
 	if err != nil {
 		return tool, err
+	}
+	if tool.Manifest.ID != p.AgentTool && len(raw) > p.MaxBundle {
+		return tool, errors.New("bundle exceeds limit")
 	}
 	if source != nil && (!strings.EqualFold(source.Repository, tool.Manifest.Source.Repository) || (expected != nil && expected.Tool != tool.Manifest.ID)) {
 		return p.Tool{}, errors.New("signed tool or source repository mismatch")
@@ -220,6 +251,10 @@ func registerBundle(tx *sql.Tx, raw []byte, tool p.Tool) error {
 	}
 	if _, err = tx.Exec("INSERT INTO bundles VALUES(?,?,?,?,?)", tool.Digest, tool.Manifest.ID, tool.Version, raw, meta); err != nil {
 		return err
+	}
+	// The authenticated connection already inventories the running Agent.
+	if tool.Manifest.ID == p.AgentTool {
+		return nil
 	}
 	rows, err := tx.Query("SELECT name FROM nodes WHERE credential<>''")
 	if err != nil {
@@ -271,11 +306,14 @@ func (s *Store) tools() ([]p.Tool, error) {
 }
 
 type Node struct {
-	Name     string `json:"name"`
-	Group    string `json:"group"`
-	Seen     int64  `json:"seen"`
-	Enrolled bool   `json:"enrolled"`
-	Online   bool   `json:"online"`
+	Name     string        `json:"name"`
+	Group    string        `json:"group"`
+	Groups   []string      `json:"groups"`
+	Seen     int64         `json:"seen"`
+	Enrolled bool          `json:"enrolled"`
+	Online   bool          `json:"online"`
+	Status   *p.HostStatus `json:"status,omitempty"`
+	StatusAt int64         `json:"statusAt,omitempty"`
 }
 type Observation struct {
 	Node           string           `json:"node"`
@@ -293,11 +331,14 @@ type Record struct {
 	Result  *p.Result `json:"result,omitempty"`
 }
 type State struct {
-	Nodes     []Node        `json:"nodes"`
-	Tools     []p.Tool      `json:"tools"`
-	Inventory []Observation `json:"inventory"`
-	Tasks     []Record      `json:"tasks"`
-	MoreTasks bool          `json:"moreTasks"`
+	CenterStatus   *p.HostStatus `json:"centerStatus,omitempty"`
+	CenterStatusAt int64         `json:"centerStatusAt,omitempty"`
+	Nodes          []Node        `json:"nodes"`
+	Tools          []p.Tool      `json:"tools"`
+	Inventory      []Observation `json:"inventory"`
+	Tasks          []Record      `json:"tasks"`
+	MoreTasks      bool          `json:"moreTasks"`
+	Rollouts       []RolloutInfo `json:"rollouts"`
 }
 
 func (s *Store) State() (State, error) {
@@ -306,15 +347,26 @@ func (s *Store) State() (State, error) {
 	if out.Tools, err = s.tools(); err != nil {
 		return out, err
 	}
-	rows, err := s.db.Query("SELECT name,group_name,seen,credential<>'' FROM nodes ORDER BY name")
+	rows, err := s.db.Query(`SELECT name,` + nodeGroupsJSON + `,seen,credential<>'',COALESCE(h.received,0),h.raw
+		FROM nodes LEFT JOIN host_status h ON h.node=nodes.name ORDER BY name`)
 	if err != nil {
 		return out, err
 	}
 	for rows.Next() {
 		var n Node
-		if err = rows.Scan(&n.Name, &n.Group, &n.Seen, &n.Enrolled); err != nil {
+		var raw, groups []byte
+		if err = rows.Scan(&n.Name, &groups, &n.Seen, &n.Enrolled, &n.StatusAt, &raw); err == nil {
+			err = json.Unmarshal(groups, &n.Groups)
+		}
+		if err == nil && raw != nil {
+			err = json.Unmarshal(raw, &n.Status)
+		}
+		if err != nil {
 			rows.Close()
 			return out, err
+		}
+		if len(n.Groups) > 0 {
+			n.Group = n.Groups[0]
 		}
 		out.Nodes = append(out.Nodes, n)
 	}
@@ -349,7 +401,9 @@ func (s *Store) State() (State, error) {
 	if err != nil {
 		return out, err
 	}
-	out.Tasks, out.MoreTasks, err = s.History(0)
+	if out.Rollouts, err = s.listRollouts(); err == nil {
+		out.Tasks, out.MoreTasks, err = s.History(0)
+	}
 	return out, err
 }
 
@@ -397,14 +451,28 @@ type Selection struct {
 	Values p.Values `json:"values"`
 }
 type Plan struct {
-	ID    string   `json:"id"`
-	Tasks []p.Task `json:"tasks"`
+	ID      string       `json:"id"`
+	Tasks   []p.Task     `json:"tasks"`
+	Rollout *RolloutStep `json:"rollout,omitempty"`
 }
 
 func newTask(node string, tool p.Tool, action string) p.Task {
 	return p.Task{ID: Token(), Node: node, Tool: tool.Manifest.ID, Bundle: tool.Digest, Version: tool.Version, Action: action, SchemaVersion: tool.Manifest.ConfigSchemaVersion}
 }
+func registeredTool(tx *sql.Tx, digest string) (p.Tool, error) {
+	var raw []byte
+	var tool p.Tool
+	if err := tx.QueryRow("SELECT meta FROM bundles WHERE digest=?", digest).Scan(&raw); err != nil {
+		return tool, err
+	}
+	err := json.Unmarshal(raw, &tool)
+	return tool, err
+}
 func (s *Store) Preview(actor string, readOnly bool, in Selection) (Plan, error) {
+	return s.preview(actor, readOnly, in, nil)
+}
+
+func (s *Store) preview(actor string, readOnly bool, in Selection, rollout *RolloutRequest) (Plan, error) {
 	var plan Plan
 	var raw []byte
 	var tool p.Tool
@@ -413,10 +481,17 @@ func (s *Store) Preview(actor string, readOnly bool, in Selection) (Plan, error)
 		return plan, err
 	}
 	defer tx.Rollback()
-	if err = tx.QueryRow("SELECT meta FROM bundles WHERE digest=?", in.Bundle).Scan(&raw); err != nil {
-		return plan, err
+	plan.ID = Token()
+	if rollout != nil {
+		if readOnly {
+			return plan, errors.New("administrator required")
+		}
+		plan.Rollout, in, err = prepareRollout(tx, *rollout, plan.ID)
+		if err != nil {
+			return plan, err
+		}
 	}
-	if err = json.Unmarshal(raw, &tool); err != nil {
+	if tool, err = registeredTool(tx, in.Bundle); err != nil {
 		return plan, err
 	}
 	action, ok := tool.Manifest.Action(in.Action)
@@ -439,7 +514,6 @@ func (s *Store) Preview(actor string, readOnly bool, in Selection) (Plan, error)
 	if (in.Action == "apply-config") != (len(in.Values) > 0) {
 		return plan, errors.New("select configuration fields only for apply-config")
 	}
-	plan.ID = Token()
 	seen := map[string]bool{}
 	for _, node := range in.Nodes {
 		if seen[node] {
@@ -451,24 +525,16 @@ func (s *Store) Preview(actor string, readOnly bool, in Selection) (Plan, error)
 			return plan, fmt.Errorf("%s is not enrolled", node)
 		}
 		t := newTask(node, tool, in.Action)
+		if err = checkAgentTarget(tx, t); err != nil {
+			return plan, err
+		}
 		t.Params = in.Params
 		if len(in.Values) > 0 {
 			config, err := configBaseline(tx, t)
 			if err != nil {
 				return plan, err
 			}
-			t.Expected = p.Values{}
-			t.Values = in.Values
-			for k, v := range in.Values {
-				if _, ok := p.Props(tool.Schema)[k]; !ok {
-					return plan, fmt.Errorf("unknown field %q", k)
-				}
-				if val, ok := config[k]; ok {
-					t.Expected[k] = val
-				}
-				config[k] = v
-			}
-			if err = p.Validate(tool.Schema, config); err != nil {
+			if err = prepareConfigTask(&t, tool, config, in.Values); err != nil {
 				return plan, fmt.Errorf("%s: %w", node, err)
 			}
 		}
@@ -510,7 +576,15 @@ func (s *Store) Publish(actor, id string) (Plan, error) {
 	if time.Now().Unix()-created > 900 {
 		return plan, errors.New("preview expired")
 	}
+	if plan.Rollout != nil {
+		if err = claimRollout(tx, plan); err != nil {
+			return plan, err
+		}
+	}
 	for _, t := range plan.Tasks {
+		if err = checkAgentTarget(tx, t); err != nil {
+			return plan, err
+		}
 		if t.Action == "apply-config" {
 			current, err := configBaseline(tx, t)
 			if err != nil {
@@ -549,6 +623,24 @@ func sameField(a, b p.Values, field string) bool {
 	y, found := b[field]
 	return ok == found && p.Same(x, y)
 }
+func prepareConfigTask(t *p.Task, tool p.Tool, baseline, values p.Values) error {
+	if baseline == nil {
+		return errors.New("缺少对应版本的配置盘点")
+	}
+	candidate := maps.Clone(baseline)
+	t.Expected = p.Values{}
+	t.Values = values
+	for key, value := range values {
+		if _, ok := p.Props(tool.Schema)[key]; !ok {
+			return fmt.Errorf("unknown field %q", key)
+		}
+		if old, ok := baseline[key]; ok {
+			t.Expected[key] = old
+		}
+		candidate[key] = value
+	}
+	return p.Validate(tool.Schema, candidate)
+}
 func enqueue(tx *sql.Tx, t p.Task, actor string) error {
 	// Bound both the reviewed task and every possible baseline from pending writes.
 	largest := p.Values{}
@@ -560,6 +652,10 @@ func enqueue(tx *sql.Tx, t p.Task, actor string) error {
 			return err
 		}
 	}
+	return insertQueuedTask(tx, t, actor, largest)
+}
+
+func insertQueuedTask(tx *sql.Tx, t p.Task, actor string, largest p.Values) error {
 	r, err := tx.Exec("INSERT INTO tasks(id,node,tool,action,digest,raw,state,actor,created) VALUES(?,?,?,?,?,?,'queued',?,?)", t.ID, t.Node, t.Tool, t.Action, t.Bundle, []byte("{}"), actor, time.Now().Unix())
 	if err != nil {
 		return err
@@ -589,7 +685,11 @@ func enqueue(tx *sql.Tx, t p.Task, actor string) error {
 // Walk backwards so a still-needed intermediate write keeps all its prerequisites.
 // An intervening different action or bundle is a barrier: it may observe that version or configuration.
 func coalescePending(tx *sql.Tx, t p.Task, largest p.Values) error {
-	rows, err := tx.Query("SELECT raw FROM tasks WHERE node=? AND tool=? AND state IN ('queued','dispatched') ORDER BY seq DESC", t.Node, t.Tool)
+	// A named workflow has its own reviewed order and receipts. Ordinary writes
+	// may coalesce only with other ordinary tasks after that workflow operation.
+	rows, err := tx.Query(`SELECT raw FROM tasks WHERE node=?1 AND tool=?2 AND state IN ('queued','dispatched')
+		AND seq>COALESCE((SELECT MAX(t.seq) FROM tasks t JOIN workflow_tasks w ON w.task=t.id
+			WHERE t.node=?1 AND t.tool=?2 AND t.state IN ('queued','dispatched')),0) ORDER BY seq DESC`, t.Node, t.Tool)
 	if err != nil {
 		return err
 	}
@@ -688,7 +788,28 @@ func (s *Store) next(ctx context.Context, node string) (p.Task, error) {
 			return t, err
 		}
 		var rejected p.Result
+		if err := checkAgentTarget(tx, t); err != nil {
+			if !errors.Is(err, errAgentTarget) {
+				return t, err
+			}
+			rejected = p.Result{Status: "failed", Summary: err.Error()}
+			if state == "dispatched" {
+				rejected.Status = "unknown"
+			}
+		}
 		if state == "queued" && t.Action == "apply-config" {
+			if t.RequireTargetVersion {
+				var current bool
+				err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM inventory WHERE node=? AND tool=?
+					AND json_extract(CAST(raw AS TEXT),'$.presence')='present'
+					AND json_extract(CAST(raw AS TEXT),'$.installedVersion')=? AND json_extract(CAST(raw AS TEXT),'$.runningVersion')=?)`, t.Node, t.Tool, t.Version, t.Version).Scan(&current)
+				if err != nil {
+					return t, err
+				}
+				if !current {
+					rejected = p.Result{Status: "conflict", Summary: "该主机的工具版本已偏离工作流目标"}
+				}
+			}
 			confirmed, err := dispatchBaseline(tx, &t)
 			if err != nil {
 				return t, err
@@ -761,6 +882,17 @@ func (s *Store) finish(t p.Task, r p.Reply) error {
 		return err
 	}
 	defer tx.Rollback()
+	if t.Tool == p.AgentTool {
+		// A replayed journal cannot overwrite the version of the process on
+		// this authenticated connection.
+		if r.Inventory, err = agentObservation(tx, t.Node); err != nil {
+			return err
+		}
+		if t.Action != "probe" && (r.Result.Status == "succeeded" || r.Result.Status == "skipped") &&
+			(r.Inventory == nil || r.Inventory.Running != t.Version) {
+			r.Result = p.Result{Status: "unknown", Summary: "重新连接的 Agent 未报告目标版本"}
+		}
+	}
 	raw, err := json.Marshal(r.Result)
 	if err != nil {
 		return err
@@ -791,6 +923,9 @@ func (s *Store) finish(t p.Task, r p.Reply) error {
 			return err
 		}
 		if _, err = tx.Exec("INSERT OR REPLACE INTO inventory VALUES(?,?,?,?)", t.Node, t.Tool, raw, time.Now().Unix()); err != nil {
+			return err
+		}
+		if err = recordRolloutProof(tx, t, r); err != nil {
 			return err
 		}
 	} else if t.Action == "apply-config" {
@@ -828,6 +963,11 @@ func (s *Store) finish(t p.Task, r p.Reply) error {
 			if _, err = tx.Exec("UPDATE config_dependencies SET confirmed=? WHERE predecessor=? AND field=?", data, t.ID, field); err != nil {
 				return err
 			}
+		}
+	}
+	if t.Action == "install" || t.RequireTargetVersion && t.Action == "apply-config" {
+		if err := finishWorkflowStep(tx, t, r); err != nil {
+			return err
 		}
 	}
 	return tx.Commit()

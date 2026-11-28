@@ -1,0 +1,7 @@
+{
+  "apiVersion": "pto-center/v1",
+  "id": "demo-info",
+  "source": {"type": "git", "repository": "pypto-tools/pto-center"},
+  "adapter": "adapter.py",
+  "capabilities": ["probe", "install"]
+}

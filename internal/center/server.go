@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/pypto-tools/pto-center/internal/hoststatus"
 	p "github.com/pypto-tools/pto-center/protocol/v1"
 )
 
@@ -27,6 +28,15 @@ var page []byte
 
 //go:embed app.js
 var js []byte
+
+//go:embed topology.js
+var topologyJS []byte
+
+//go:embed fleet-views.js
+var fleetViewsJS []byte
+
+//go:embed workflows.js
+var workflowsJS []byte
 
 //go:embed style.css
 var css []byte
@@ -39,10 +49,27 @@ type Server struct {
 	syncMu        sync.Mutex
 	mu            sync.Mutex
 	peers         map[string]chan struct{}
+	hostStatus    *p.HostStatus
+	hostStatusAt  int64
 }
 
 func New(s *Store, admin, viewer string) *Server {
 	return &Server{Store: s, Admin: admin, Viewer: viewer, peers: map[string]chan struct{}{}}
+}
+func (s *Server) MonitorHost(ctx context.Context) {
+	tick := time.NewTicker(hoststatus.Interval)
+	defer tick.Stop()
+	for ctx.Err() == nil {
+		sample := hoststatus.Collect(ctx)
+		s.mu.Lock()
+		s.hostStatus, s.hostStatusAt = &sample, time.Now().Unix()
+		s.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
+	}
 }
 func (s *Server) wake() {
 	s.mu.Lock()
@@ -61,6 +88,19 @@ func respond(w http.ResponseWriter, code int, data any) {
 }
 func problem(w http.ResponseWriter, code int, err error) {
 	respond(w, code, map[string]string{"error": err.Error()})
+}
+func workflowProblem(w http.ResponseWriter, err error) {
+	var invalid workflowInputError
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		problem(w, http.StatusNotFound, errors.New("未找到工作流或运行记录"))
+	case errors.Is(err, errWorkflowConflict):
+		problem(w, http.StatusConflict, err)
+	case errors.As(err, &invalid):
+		problem(w, http.StatusBadRequest, err)
+	default:
+		problem(w, http.StatusInternalServerError, errors.New("读写工作流失败"))
+	}
 }
 func decode(w http.ResponseWriter, r *http.Request, out any, limit int64) error {
 	d := json.NewDecoder(http.MaxBytesReader(w, r.Body, limit))
@@ -98,6 +138,43 @@ func (s *Server) AdminHandler() http.Handler {
 			case "/app.js":
 				w.Header().Set("Content-Type", "application/javascript")
 				w.Write(js)
+			case "/topology.js":
+				w.Header().Set("Content-Type", "application/javascript")
+				w.Write(topologyJS)
+			case "/fleet-views.js":
+				w.Header().Set("Content-Type", "application/javascript")
+				w.Write(fleetViewsJS)
+			case "/workflows.js":
+				w.Header().Set("Content-Type", "application/javascript")
+				w.Write(workflowsJS)
+			case "/api/workflows":
+				var before int64
+				if cursor := r.URL.Query().Get("before"); cursor != "" {
+					var err error
+					before, err = strconv.ParseInt(cursor, 10, 64)
+					if err != nil || before < 1 {
+						problem(w, 400, errors.New("invalid workflow cursor"))
+						return
+					}
+				}
+				catalog, err := s.Store.Workflows(before)
+				if err != nil {
+					workflowProblem(w, err)
+					return
+				}
+				respond(w, 200, catalog)
+			case "/api/workflow-run":
+				id := r.URL.Query().Get("id")
+				if !p.Digest.MatchString(id) {
+					problem(w, 400, errors.New("invalid workflow run ID"))
+					return
+				}
+				run, err := s.Store.WorkflowRun(id, r.URL.Query().Get("node"))
+				if err != nil {
+					workflowProblem(w, err)
+					return
+				}
+				respond(w, 200, run)
 			case "/api/state":
 				state, err := s.Store.State()
 				if err != nil {
@@ -105,6 +182,7 @@ func (s *Server) AdminHandler() http.Handler {
 					return
 				}
 				s.mu.Lock()
+				state.CenterStatus, state.CenterStatusAt = s.hostStatus, s.hostStatusAt
 				for i := range state.Nodes {
 					_, state.Nodes[i].Online = s.peers[state.Nodes[i].Name]
 				}
@@ -113,6 +191,34 @@ func (s *Server) AdminHandler() http.Handler {
 					State
 					Role string `json:"role"`
 				}{state, name})
+			case "/api/agent-versions":
+				node := r.URL.Query().Get("node")
+				if !p.Name.MatchString(node) {
+					problem(w, 400, errors.New("invalid node name"))
+					return
+				}
+				history, err := s.Store.agentVersions(node)
+				if err != nil {
+					problem(w, 500, err)
+					return
+				}
+				respond(w, 200, history)
+			case "/api/rollout":
+				id := r.URL.Query().Get("id")
+				if !p.Digest.MatchString(id) {
+					problem(w, 400, errors.New("invalid rollout ID"))
+					return
+				}
+				round, err := s.Store.Rollout(id)
+				if errors.Is(err, sql.ErrNoRows) {
+					http.NotFound(w, r)
+					return
+				}
+				if err != nil {
+					problem(w, 500, err)
+					return
+				}
+				respond(w, 200, round)
 			case "/api/history":
 				before, err := strconv.ParseInt(r.URL.Query().Get("before"), 10, 64)
 				if err != nil || before <= 0 {
@@ -152,6 +258,53 @@ func (s *Server) AdminHandler() http.Handler {
 			return
 		}
 		switch r.URL.Path {
+		case "/api/workflows", "/api/workflow-run":
+			if !admin {
+				http.Error(w, "administrator required", 403)
+				return
+			}
+			if r.URL.Path == "/api/workflows" {
+				var in WorkflowDefinition
+				if err := decode(w, r, &in, 64<<10); err != nil {
+					problem(w, 400, err)
+					return
+				}
+				template, err := s.Store.SaveWorkflow(in)
+				if err != nil {
+					workflowProblem(w, err)
+					return
+				}
+				respond(w, 200, template)
+				return
+			}
+			var in WorkflowStart
+			if err := decode(w, r, &in, 64<<10); err != nil {
+				problem(w, 400, err)
+				return
+			}
+			id, err := s.Store.StartWorkflow(name, in)
+			if err != nil {
+				workflowProblem(w, err)
+				return
+			}
+			s.wake()
+			respond(w, 200, map[string]string{"id": id})
+		case "/api/rollout-preview":
+			if !admin {
+				http.Error(w, "administrator required", 403)
+				return
+			}
+			var in RolloutRequest
+			if err := decode(w, r, &in, 4096); err != nil {
+				problem(w, 400, err)
+				return
+			}
+			plan, err := s.Store.preview(name, false, Selection{}, &in)
+			if err != nil {
+				problem(w, 400, err)
+				return
+			}
+			respond(w, 200, plan)
 		case "/api/preview":
 			var in Selection
 			if err := decode(w, r, &in, 1<<20); err != nil {
@@ -192,7 +345,7 @@ func (s *Server) AdminHandler() http.Handler {
 					raw, err = s.githubBundle(r.Context(), in.Repository, in.Commit, in.Path)
 				}
 			} else {
-				raw, err = io.ReadAll(http.MaxBytesReader(w, r.Body, p.MaxBundle))
+				raw, err = io.ReadAll(http.MaxBytesReader(w, r.Body, p.MaxAgentBundle))
 			}
 			if err != nil {
 				problem(w, 400, err)
@@ -221,17 +374,44 @@ func (s *Server) AdminHandler() http.Handler {
 				http.Error(w, "administrator required", 403)
 				return
 			}
-			var in struct{ Name, Group string }
-			if err := decode(w, r, &in, 1024); err != nil {
+			var in struct {
+				Name, Group string
+				Groups      []string
+			}
+			if err := decode(w, r, &in, 64<<10); err != nil {
 				problem(w, 400, err)
 				return
 			}
-			token, err := s.Store.Invite(in.Name, in.Group)
+			token, err := s.Store.Invite(in.Name, append([]string{in.Group}, in.Groups...)...)
 			if err != nil {
 				problem(w, 400, err)
 				return
 			}
 			respond(w, 201, map[string]string{"invite": token})
+		case "/api/node-groups":
+			if !admin {
+				http.Error(w, "administrator required", 403)
+				return
+			}
+			var in struct {
+				Name                   string
+				Groups, ExpectedGroups []string
+			}
+			if err := decode(w, r, &in, 128<<10); err != nil {
+				problem(w, 400, err)
+				return
+			}
+			if err := s.Store.SetGroups(in.Name, in.ExpectedGroups, in.Groups); err != nil {
+				code := http.StatusBadRequest
+				if errors.Is(err, errGroupsChanged) {
+					code = http.StatusConflict
+				} else if errors.Is(err, sql.ErrNoRows) {
+					code = http.StatusNotFound
+				}
+				problem(w, code, err)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
 		default:
 			http.NotFound(w, r)
 		}
@@ -245,7 +425,7 @@ func (s *Server) githubBundle(ctx context.Context, repo, commit, path string) ([
 	if !repoName.MatchString(repo) || !commitName.MatchString(commit) || !p.SafePath(path) {
 		return nil, errors.New("expected a GitHub owner/repository, full commit and relative bundle path")
 	}
-	return s.github(ctx, "https://api.github.com/repos/"+repo+"/contents/"+path+"?ref="+commit, "application/vnd.github.raw+json", p.MaxBundle)
+	return s.github(ctx, "https://api.github.com/repos/"+repo+"/contents/"+path+"?ref="+commit, "application/vnd.github.raw+json", p.MaxAgentBundle)
 }
 func (s *Server) github(ctx context.Context, address, accept string, limit int64) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", address, nil)
@@ -287,7 +467,8 @@ func (s *Server) NodeHandler() http.Handler {
 			w.WriteHeader(204)
 			return
 		}
-		if r.Method != "GET" {
+		reporting := r.Method == "POST" && r.URL.Path == "/status"
+		if r.Method != "GET" && !reporting {
 			http.NotFound(w, r)
 			return
 		}
@@ -295,6 +476,27 @@ func (s *Server) NodeHandler() http.Handler {
 		token, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
 		if !ok || !s.Store.Auth(node, token) {
 			http.Error(w, "invalid node credential", 403)
+			return
+		}
+		if reporting {
+			var status *p.HostStatus
+			if err := decode(w, r, &status, p.MaxHostStatusBytes); err != nil || status == nil {
+				http.Error(w, "invalid host status", 400)
+				return
+			}
+			if err := status.Validate(); err != nil {
+				problem(w, 400, err)
+				return
+			}
+			if err := s.Store.saveHostStatus(node, token, *status); err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					http.Error(w, "invalid node credential", 403)
+				} else {
+					http.Error(w, "could not save host status", 500)
+				}
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 		if r.URL.Path == "/connect" {
@@ -316,6 +518,11 @@ func (s *Server) NodeHandler() http.Handler {
 	})
 }
 func (s *Server) servePeer(w http.ResponseWriter, r *http.Request, node string) {
+	inv, err := reportedAgent(r.Header)
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
 	s.mu.Lock()
 	if _, exists := s.peers[node]; exists {
 		s.mu.Unlock()
@@ -327,11 +534,15 @@ func (s *Server) servePeer(w http.ResponseWriter, r *http.Request, node string) 
 	s.mu.Unlock()
 	defer func() { s.mu.Lock(); delete(s.peers, node); s.mu.Unlock() }()
 	upgrader := websocket.Upgrader{HandshakeTimeout: 10 * time.Second}
-	ws, err := upgrader.Upgrade(w, r, nil)
+	ws, err := upgrader.Upgrade(w, r, http.Header{p.HostStatusHeader: {"1"}})
 	if err != nil {
 		return
 	}
 	defer ws.Close()
+	key, _ := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if err := s.Store.recordAgentConnection(node, key, inv); err != nil {
+		return
+	}
 	ws.SetReadLimit(p.MaxReplyBytes)
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()

@@ -16,6 +16,9 @@ trap cleanup EXIT
 trap 'exit 0' INT TERM
 bin/pto-center keygen --dir "$sandbox_dir/keys"
 bin/pto-center init --state "$sandbox_dir/center" --trust "$sandbox_dir/keys/release.pub"
+bin/pto-center pack --dir examples/demo-info --version v1 --payload demo-info \
+    --signing-key "$sandbox_dir/keys/signing.key" --out "$sandbox_dir/demo-info.json"
+bin/pto-center register --state "$sandbox_dir/center" --file "$sandbox_dir/demo-info.json"
 for v in v1 v2; do
     bin/pto-center pack --dir examples/demo --version "$v" --signing-key "$sandbox_dir/keys/signing.key" --out "$sandbox_dir/$v.json"
     bin/pto-center register --state "$sandbox_dir/center" --file "$sandbox_dir/$v.json"
