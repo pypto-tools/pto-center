@@ -92,3 +92,33 @@ func ReadLimit(path string, limit int64) ([]byte, error) {
 	}
 	return b, err
 }
+
+// Replace publishes a complete file on the same filesystem and syncs its directory.
+func Replace(path string, data []byte, mode os.FileMode) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return err
+	}
+	f, err := os.CreateTemp(dir, ".write-")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(f.Name())
+	if err = f.Chmod(mode); err == nil {
+		_, err = f.Write(data)
+	}
+	if err == nil {
+		err = f.Sync()
+	}
+	closeErr := f.Close()
+	if err != nil {
+		return err
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	if err = os.Rename(f.Name(), path); err != nil {
+		return err
+	}
+	return SyncDir(dir)
+}

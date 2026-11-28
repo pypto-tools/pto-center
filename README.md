@@ -21,6 +21,7 @@ make demo
 | 我想做什么 | 从哪里开始 |
 |---|---|
 | 部署中心，让一台新机加入 | [NetBird 端口、systemd 与首次注册](docs/running.md#netbird-部署) |
+| 下载 Center 和 Agent，后续在网页升级 | [平台发行版](https://github.com/pypto-tools/pto-center/releases) · [首装验签和网页升级](docs/running.md#平台首装和网页升级) |
 | 给一台或多台机器按顺序安装软件、应用配置 | [创建、编辑和重跑工作流](docs/running.md#新主机与安装工作流) |
 | 让自己的工具进入可安装列表，增加配置字段或操作按钮 | [工具仓库接入指南](docs/tool-integration.md) |
 | 让网页显示安装卡在哪一步、失败原因是什么 | [上报环境检查、安装和验收状态](docs/tool-integration.md#上报安装阶段) |

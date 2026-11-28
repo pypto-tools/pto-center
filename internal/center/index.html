@@ -95,6 +95,15 @@
           <h1 id="tools-title">工具与配置</h1>
           <button id="register" class="primary admin" hidden>注册发布包</button>
         </div>
+        <div class="panel" id="center-update" hidden>
+          <div class="panel-head"><h2>中心版本</h2><span id="center-running"></span><button id="platform-sync" class="admin" hidden>同步官方版本</button></div>
+          <div class="picker">
+            <label for="center-target">发布版本</label><select id="center-target"></select>
+            <button id="center-upgrade" class="primary admin" hidden>更新中心</button>
+            <button id="center-rollback" class="admin" hidden>回退到所选版本</button>
+            <span id="center-result" role="status"></span>
+          </div>
+        </div>
         <div class="panel picker">
           <label for="tool">工具及发布版本</label>
           <select id="tool"></select>

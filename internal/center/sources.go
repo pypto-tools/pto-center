@@ -4,10 +4,77 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	p "github.com/pypto-tools/pto-center/protocol/v1"
+	"fmt"
 	"net/url"
+	"strconv"
+	"strings"
 	"time"
+
+	p "github.com/pypto-tools/pto-center/protocol/v1"
 )
+
+// Register the two artifacts of one published platform version atomically.
+// Downloading and registering a release never dispatches an update.
+func (s *Server) syncPlatformRelease(ctx context.Context) ([]p.Tool, error) {
+	s.syncMu.Lock()
+	defer s.syncMu.Unlock()
+	const releases = "https://api.github.com/repos/pypto-tools/pto-center/releases"
+	raw, err := s.github(ctx, releases+"/latest", "application/vnd.github+json", 2<<20)
+	if err != nil {
+		return nil, err
+	}
+	var release struct {
+		Tag               string `json:"tag_name"`
+		Draft, Prerelease bool
+		Assets            []struct {
+			ID   int64
+			Name string
+		}
+	}
+	if json.Unmarshal(raw, &release) != nil || release.Draft || release.Prerelease || !strings.HasPrefix(release.Tag, "v") || !p.Version.MatchString(release.Tag) {
+		return nil, errors.New("GitHub 未返回有效的正式平台版本")
+	}
+	assets := map[string]int64{}
+	for _, a := range release.Assets {
+		assets[a.Name] = a.ID
+	}
+	var tools []p.Tool
+	var files [][]byte
+	for _, name := range []string{p.CenterTool, p.AgentTool} {
+		filename := name + "-" + release.Tag + ".json"
+		id := assets[filename]
+		if id <= 0 {
+			return nil, fmt.Errorf("发行版缺少 %s", filename)
+		}
+		raw, err := s.githubDownload(ctx, releases+"/assets/"+strconv.FormatInt(id, 10), "application/octet-stream", p.MaxAgentBundle, true)
+		if err != nil {
+			return nil, err
+		}
+		var b p.Bundle
+		if err := json.Unmarshal(raw, &b); err != nil {
+			return nil, err
+		}
+		tool, err := b.Verify(s.Store.key)
+		if err != nil {
+			return nil, err
+		}
+		if tool.Manifest.ID != name || tool.Version != release.Tag {
+			return nil, fmt.Errorf("%s 的签名内容与组件或标签不符", filename)
+		}
+		tools, files = append(tools, tool), append(files, raw)
+	}
+	tx, err := s.Store.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	for i, tool := range tools {
+		if err := registerBundle(tx, files[i], tool); err != nil {
+			return nil, err
+		}
+	}
+	return tools, tx.Commit()
+}
 
 type SourceRecord struct {
 	generation int64

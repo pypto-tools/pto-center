@@ -358,6 +358,7 @@ async function refresh() {
   fleetTable();
   document.querySelectorAll('.admin').forEach(
       e => e.hidden = state.role !== 'admin');
+  renderCenterUpdate();
   const old = el('tool').value;
   el('tool').replaceChildren();
   for (const t of state.tools) {
@@ -373,6 +374,47 @@ async function refresh() {
   await renderHistory();
   if (!el('fleet').hidden) await updateTopology();
   if (!el('workflows').hidden) await workflowPage.refresh();
+}
+let centerRequest, centerSending = false;
+function renderCenterUpdate() {
+  const info = state.centerUpdate, panel = el('center-update');
+  panel.hidden = !info;
+  if (!info) return;
+  el('center-running').textContent = info.running + ' · ' + info.platform;
+  const available = info.releases.filter(tool => tool.platforms.includes(info.platform));
+  const select = el('center-target'), previous = select.value;
+  select.replaceChildren(...available.map(tool => new Option(tool.version, tool.digest)));
+  if (available.some(tool => tool.digest === previous)) select.value = previous;
+  const last = info.last;
+  el('center-result').textContent = last ? last.expected + ' → ' + last.version + ' · ' + last.summary :
+      !info.managed ? '中心机执行器未启用' : !available.length ? '等待注册本机架构的中心签名包' : '';
+  const updateButtons = () => {
+    const target = available.find(tool => tool.digest === select.value);
+    const disabled = !target || target.version === info.running || !info.managed || centerSending ||
+        ['queued', 'running'].includes(last?.state);
+    el('center-upgrade').disabled = el('center-rollback').disabled = disabled;
+  };
+  select.onchange = updateButtons;
+  updateButtons();
+}
+async function switchCenter(action) {
+  const bundle = el('center-target').value, expected = state.centerUpdate.running;
+  if (!centerRequest || centerRequest.action !== action || centerRequest.bundle !== bundle || centerRequest.expected !== expected) {
+    const bytes = crypto.getRandomValues(new Uint8Array(32));
+    const id = Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
+    centerRequest = {id, action, bundle, expected};
+  }
+  centerSending = true;
+  renderCenterUpdate();
+  try {
+    const result = await api('center-update', centerRequest);
+    centerRequest = undefined;
+    el('center-result').textContent = result.summary;
+    await refresh();
+  } finally {
+    centerSending = false;
+    renderCenterUpdate();
+  }
 }
 function chooseTool() {
   ++previewGeneration;
@@ -812,6 +854,18 @@ el('fleet-filter').oninput = fleetTable;
 el('host-invite').onclick = invite;
 el('invite').onclick = invite;
 el('register').onclick = register;
+el('platform-sync').onclick = () => tryRun(async () => {
+  el('platform-sync').disabled = true;
+  try {
+    const tools = await api('platform-sync', {});
+    notice('已登记 ' + tools.map(t => t.manifest.id + ' ' + t.version).join('、'));
+    await refresh();
+  } finally {
+    el('platform-sync').disabled = false;
+  }
+});
+el('center-upgrade').onclick = () => tryRun(() => switchCenter('update'));
+el('center-rollback').onclick = () => tryRun(() => switchCenter('rollback'));
 el('refresh').onclick = () => tryRun(() => refresh());
 el('close').onclick = () => el('dialog').close();
 el('preview').onclick = () => tryRun(preview);

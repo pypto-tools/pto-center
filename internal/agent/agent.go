@@ -39,34 +39,6 @@ type Agent struct {
 	runningBundle           string
 }
 
-func atomicFile(path string, data []byte, mode os.FileMode) error {
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return err
-	}
-	f, err := os.CreateTemp(dir, ".write-")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(f.Name())
-	if err = f.Chmod(mode); err == nil {
-		_, err = f.Write(data)
-	}
-	if err == nil {
-		err = f.Sync()
-	}
-	closeErr := f.Close()
-	if err != nil {
-		return err
-	}
-	if closeErr != nil {
-		return closeErr
-	}
-	if err = os.Rename(f.Name(), path); err != nil {
-		return err
-	}
-	return localfiles.SyncDir(dir)
-}
 func (a Agent) credential() (string, error) {
 	path := filepath.Join(a.Dir, "credential")
 	b, err := os.ReadFile(path)
@@ -84,7 +56,7 @@ func (a Agent) credential() (string, error) {
 		return "", err
 	}
 	v := hex.EncodeToString(raw[:])
-	return v, atomicFile(path, []byte(v), 0600)
+	return v, localfiles.Replace(path, []byte(v), 0600)
 }
 func (a Agent) client() *http.Client {
 	return &http.Client{Timeout: 45 * time.Second, Transport: &http.Transport{TLSClientConfig: a.TLS}, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
@@ -304,7 +276,7 @@ func (a Agent) load(ctx context.Context, key, digest string) (p.Tool, p.Release,
 		return tool, b.Release, errors.New("bundle too large")
 	}
 	if fresh {
-		err = atomicFile(cache, raw, 0600)
+		err = localfiles.Replace(cache, raw, 0600)
 	}
 	return tool, b.Release, err
 }
@@ -342,6 +314,9 @@ func (a Agent) handle(ctx context.Context, key string, t p.Task, emit func(p.Res
 	}
 	if !p.Digest.MatchString(t.ID) || t.Node != a.Name {
 		return reply, errors.New("misaddressed or invalid task")
+	}
+	if t.Tool == p.CenterTool {
+		return fail(errors.New("中心版本由中心机执行器负责"))
 	}
 	path := filepath.Join(a.Dir, "journal", t.ID+".json")
 	req, _ := json.Marshal(t)
@@ -382,7 +357,7 @@ func (a Agent) handle(ctx context.Context, key string, t p.Task, emit func(p.Res
 			j.Effect = action.Effect
 			if !started || action.Effect == "read" {
 				data, _ := json.Marshal(j)
-				if err = atomicFile(path, data, 0600); err != nil {
+				if err = localfiles.Replace(path, data, 0600); err != nil {
 					return reply, err
 				}
 				reply = a.execute(ctx, t, tool, release, emit)
@@ -398,7 +373,7 @@ func (a Agent) handle(ctx context.Context, key string, t p.Task, emit func(p.Res
 	if err != nil {
 		return reply, err
 	}
-	if err = atomicFile(path, data, 0600); err != nil {
+	if err = localfiles.Replace(path, data, 0600); err != nil {
 		return reply, err
 	}
 	return reply, nil

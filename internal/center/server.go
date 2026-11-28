@@ -13,12 +13,14 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/pypto-tools/pto-center/internal/buildversion"
 	"github.com/pypto-tools/pto-center/internal/hoststatus"
 	p "github.com/pypto-tools/pto-center/protocol/v1"
 )
@@ -43,6 +45,7 @@ var css []byte
 
 type Server struct {
 	Store         *Store
+	Supervised    bool
 	Admin, Viewer string
 	GitHubToken   string
 	transport     http.RoundTripper
@@ -147,6 +150,15 @@ func (s *Server) AdminHandler() http.Handler {
 			case "/workflows.js":
 				w.Header().Set("Content-Type", "application/javascript")
 				w.Write(workflowsJS)
+			case "/api/version":
+				if err := s.Store.db.PingContext(r.Context()); err != nil {
+					problem(w, http.StatusServiceUnavailable, err)
+					return
+				}
+				respond(w, http.StatusOK, map[string]string{
+					"version": buildversion.Current(), "platform": runtime.GOOS + "/" + runtime.GOARCH,
+					"apiVersion": "pto-center/v1",
+				})
 			case "/api/workflows":
 				var before int64
 				if cursor := r.URL.Query().Get("before"); cursor != "" {
@@ -187,10 +199,16 @@ func (s *Server) AdminHandler() http.Handler {
 					_, state.Nodes[i].Online = s.peers[state.Nodes[i].Name]
 				}
 				s.mu.Unlock()
+				updates, err := s.centerUpdateInfo()
+				if err != nil {
+					problem(w, 500, err)
+					return
+				}
 				respond(w, 200, struct {
 					State
-					Role string `json:"role"`
-				}{state, name})
+					Role         string           `json:"role"`
+					CenterUpdate centerUpdateInfo `json:"centerUpdate"`
+				}{state, name, updates})
 			case "/api/agent-versions":
 				node := r.URL.Query().Get("node")
 				if !p.Name.MatchString(node) {
@@ -258,6 +276,37 @@ func (s *Server) AdminHandler() http.Handler {
 			return
 		}
 		switch r.URL.Path {
+		case "/api/platform-sync":
+			if !admin {
+				http.Error(w, "administrator required", 403)
+				return
+			}
+			tools, err := s.syncPlatformRelease(r.Context())
+			if err != nil {
+				problem(w, http.StatusBadGateway, err)
+				return
+			}
+			respond(w, 200, tools)
+		case "/api/center-update":
+			if !admin {
+				http.Error(w, "administrator required", 403)
+				return
+			}
+			if !s.Supervised {
+				problem(w, 409, errors.New("中心机执行器未启用"))
+				return
+			}
+			var in centerChangeRequest
+			if err := decode(w, r, &in, 4096); err != nil {
+				problem(w, 400, err)
+				return
+			}
+			change, err := s.Store.queueCenterChange(in, buildversion.Current())
+			if err != nil {
+				problem(w, 409, err)
+				return
+			}
+			respond(w, http.StatusAccepted, change)
 		case "/api/workflows", "/api/workflow-run":
 			if !admin {
 				http.Error(w, "administrator required", 403)
@@ -428,6 +477,9 @@ func (s *Server) githubBundle(ctx context.Context, repo, commit, path string) ([
 	return s.github(ctx, "https://api.github.com/repos/"+repo+"/contents/"+path+"?ref="+commit, "application/vnd.github.raw+json", p.MaxAgentBundle)
 }
 func (s *Server) github(ctx context.Context, address, accept string, limit int64) ([]byte, error) {
+	return s.githubDownload(ctx, address, accept, limit, false)
+}
+func (s *Server) githubDownload(ctx context.Context, address, accept string, limit int64, releaseAsset bool) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", address, nil)
 	if err != nil {
 		return nil, err
@@ -436,7 +488,17 @@ func (s *Server) github(ctx context.Context, address, accept string, limit int64
 	if s.GitHubToken != "" {
 		req.Header.Set("Authorization", "Bearer "+s.GitHubToken)
 	}
-	client := http.Client{Transport: s.transport, Timeout: 30 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	client := http.Client{Transport: s.transport, Timeout: 45 * time.Second, CheckRedirect: func(next *http.Request, via []*http.Request) error {
+		if !releaseAsset {
+			return http.ErrUseLastResponse
+		}
+		if len(via) > 3 || next.URL.Scheme != "https" || next.URL.User != nil ||
+			(next.URL.Host != "release-assets.githubusercontent.com" && next.URL.Host != "objects.githubusercontent.com") {
+			return errors.New("unexpected GitHub release asset redirect")
+		}
+		next.Header.Del("Authorization")
+		return nil
+	}}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err

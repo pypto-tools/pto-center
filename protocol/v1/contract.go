@@ -264,12 +264,12 @@ func (r Release) Inspect() (Tool, error) {
 	}
 	tool := Tool{Manifest: m, Version: r.Version, Schema: r.Schema, Digest: Hash(b)}
 	limit := MaxBundle
-	if m.ID == AgentTool {
+	if m.ID == AgentTool || m.ID == CenterTool {
 		limit = MaxAgentBundle
-		if !bytes.Equal(r.Adapter, []byte(agentFallback)) || m.Adapter != "builtin/agent" ||
+		if !bytes.Equal(r.Adapter, []byte(agentFallback)) || m.Adapter != "builtin/"+strings.TrimPrefix(m.ID, "pto-") ||
 			m.Source.Repository != "pypto-tools/pto-center" || !slices.Equal(m.Capabilities, []string{"probe", "update", "rollback"}) ||
 			len(m.Actions) != 0 || m.ConfigSchema != "" {
-			return Tool{}, errors.New("pto-agent requires a native agent release")
+			return Tool{}, fmt.Errorf("%s requires a native release", m.ID)
 		}
 		_, tool.Platforms, err = agentArchive(r.Payload)
 		if err != nil {

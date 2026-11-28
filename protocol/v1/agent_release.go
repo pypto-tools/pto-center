@@ -13,12 +13,14 @@ import (
 
 const (
 	AgentTool           = "pto-agent"
+	CenterTool          = "pto-center"
 	MaxAgentBundle      = 32 << 20
 	MaxAgentBinary      = 48 << 20
 	AgentVersionHeader  = "X-PTO-Agent-Version"
 	AgentPlatformHeader = "X-PTO-Agent-Platform"
 	AgentManagedHeader  = "X-PTO-Agent-Managed"
 	agentManifest       = `{"apiVersion":"pto-center/v1","id":"pto-agent","source":{"type":"git","repository":"pypto-tools/pto-center"},"adapter":"builtin/agent","capabilities":["probe","update","rollback"]}`
+	centerManifest      = `{"apiVersion":"pto-center/v1","id":"pto-center","source":{"type":"git","repository":"pypto-tools/pto-center"},"adapter":"builtin/center","capabilities":["probe","update","rollback"]}`
 	// A pre-management Agent interpreting this as an ordinary adapter can only
 	// report unknown. Only the native updater may activate the payload.
 	agentFallback = "#!/bin/sh\necho '{\"status\":\"succeeded\",\"data\":{\"presence\":\"unknown\"}}'\n"
@@ -26,19 +28,24 @@ const (
 
 var AgentPlatform = regexp.MustCompile(`^linux/[a-z0-9]{2,16}$`)
 
-func binaryPlatform(binary []byte) (string, error) {
+func binaryPlatform(tool string, binary []byte) (string, error) {
 	info, err := buildinfo.Read(bytes.NewReader(binary))
-	if err != nil || info.Path != "github.com/pypto-tools/pto-center/cmd/pto-agent" {
-		return "", errors.New("expected a Go pto-agent executable")
+	if err != nil || info.Path != "github.com/pypto-tools/pto-center/cmd/"+tool {
+		return "", fmt.Errorf("expected a Go %s executable", tool)
 	}
-	var osName, arch string
+	var osName, arch, cgo string
 	for _, s := range info.Settings {
 		switch s.Key {
 		case "GOOS":
 			osName = s.Value
 		case "GOARCH":
 			arch = s.Value
+		case "CGO_ENABLED":
+			cgo = s.Value
 		}
+	}
+	if tool == CenterTool && cgo != "1" {
+		return "", errors.New("Center requires a build with SQLite and CGO enabled")
 	}
 	platform := osName + "/" + arch
 	if !AgentPlatform.MatchString(platform) {
@@ -48,9 +55,17 @@ func binaryPlatform(binary []byte) (string, error) {
 }
 
 func NewAgentRelease(version string, binaries [][]byte) (Release, error) {
-	r := Release{Manifest: []byte(agentManifest), Version: version, Adapter: []byte(agentFallback)}
+	return newNativeRelease(AgentTool, agentManifest, version, binaries)
+}
+
+func NewCenterRelease(version string, binaries [][]byte) (Release, error) {
+	return newNativeRelease(CenterTool, centerManifest, version, binaries)
+}
+
+func newNativeRelease(tool, manifest, version string, binaries [][]byte) (Release, error) {
+	r := Release{Manifest: []byte(manifest), Version: version, Adapter: []byte(agentFallback)}
 	if !Version.MatchString(version) || len(binaries) == 0 {
-		return r, errors.New("provide a version and at least one pto-agent executable")
+		return r, fmt.Errorf("provide a version and at least one %s executable", tool)
 	}
 	images := make(map[string][]byte)
 	var platforms []string
@@ -58,7 +73,7 @@ func NewAgentRelease(version string, binaries [][]byte) (Release, error) {
 		if len(b) > MaxAgentBinary {
 			return r, errors.New("agent executable exceeds size limit")
 		}
-		platform, err := binaryPlatform(b)
+		platform, err := binaryPlatform(tool, b)
 		if err != nil {
 			return r, err
 		}
@@ -109,6 +124,14 @@ func agentArchive(data []byte) (*zip.Reader, []string, error) {
 
 // AgentImage reads a single bounded archive entry, never a path from the archive.
 func (r Release) AgentImage(platform string) ([]byte, error) {
+	return r.nativeImage(AgentTool, platform)
+}
+
+func (r Release) CenterImage(platform string) ([]byte, error) {
+	return r.nativeImage(CenterTool, platform)
+}
+
+func (r Release) nativeImage(tool, platform string) ([]byte, error) {
 	z, _, err := agentArchive(r.Payload)
 	if err != nil {
 		return nil, err
@@ -126,7 +149,7 @@ func (r Release) AgentImage(platform string) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		actual, err := binaryPlatform(binary)
+		actual, err := binaryPlatform(tool, binary)
 		if err != nil || len(binary) > MaxAgentBinary || actual != platform {
 			return nil, errors.New("agent executable does not match this platform")
 		}

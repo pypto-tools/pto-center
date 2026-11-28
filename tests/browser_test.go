@@ -76,24 +76,8 @@ func (d *devTools) wait(expr string) {
 	}
 	d.t.Fatalf("browser condition timed out: %s", expr)
 }
-func TestBrowserBatchConfiguration(t *testing.T) {
-	chrome := os.Getenv("PTO_CHROME")
-	if chrome == "" {
-		t.Skip("set PTO_CHROME to a Chromium executable for interactive UI coverage")
-	}
-	l := newLab(t)
-	v := l.bundle("v1")
-	both := []string{"node-a", "node-b"}
-	for _, n := range both {
-		l.add(n, v)
-	}
-	if err := l.store.SetGroups("node-b", []string{"test"}, []string{"User"}); err != nil {
-		t.Fatal(err)
-	}
-	l.run(v, "install", both, nil, nil, "succeeded")
-	// Same store and admin UI. Only this local browser uses an HTTP loopback entry point.
-	ui := httptest.NewServer(l.svc.AdminHandler())
-	defer ui.Close()
+func startBrowser(t *testing.T, chrome, password string) devTools {
+	t.Helper()
 	profile := t.TempDir()
 	ctx, cancel := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(ctx, chrome, "--headless=new", "--disable-gpu", "--no-sandbox", "--disable-dev-shm-usage", "--disable-background-networking", "--remote-debugging-port=0", "--user-data-dir="+profile, "about:blank")
@@ -106,7 +90,7 @@ func TestBrowserBatchConfiguration(t *testing.T) {
 	exited := make(chan error, 1)
 	go func() { exited <- cmd.Wait(); close(exited) }()
 	var conn *websocket.Conn
-	defer func() {
+	t.Cleanup(func() {
 		if conn != nil {
 			// Let the browser flush its profile and stop its renderers itself.
 			conn.SetWriteDeadline(time.Now().Add(time.Second))
@@ -135,7 +119,7 @@ func TestBrowserBatchConfiguration(t *testing.T) {
 			}
 			time.Sleep(30 * time.Millisecond)
 		}
-	}()
+	})
 	startup, stopStartup := context.WithTimeout(ctx, 90*time.Second)
 	defer stopStartup()
 	poll := time.NewTicker(100 * time.Millisecond)
@@ -199,7 +183,29 @@ func TestBrowserBatchConfiguration(t *testing.T) {
 	poll.Stop()
 	d := devTools{t: t, conn: conn}
 	d.call("Network.enable", map[string]any{})
-	d.call("Network.setExtraHTTPHeaders", map[string]any{"headers": map[string]string{"Authorization": "Basic " + base64.StdEncoding.EncodeToString([]byte("admin:test-admin"))}})
+	d.call("Network.setExtraHTTPHeaders", map[string]any{"headers": map[string]string{"Authorization": "Basic " + base64.StdEncoding.EncodeToString([]byte("admin:"+password))}})
+	return d
+}
+
+func TestBrowserBatchConfiguration(t *testing.T) {
+	chrome := os.Getenv("PTO_CHROME")
+	if chrome == "" {
+		t.Skip("set PTO_CHROME to a Chromium executable for interactive UI coverage")
+	}
+	l := newLab(t)
+	v := l.bundle("v1")
+	both := []string{"node-a", "node-b"}
+	for _, n := range both {
+		l.add(n, v)
+	}
+	if err := l.store.SetGroups("node-b", []string{"test"}, []string{"User"}); err != nil {
+		t.Fatal(err)
+	}
+	l.run(v, "install", both, nil, nil, "succeeded")
+	// Same store and admin UI. Only this local browser uses an HTTP loopback entry point.
+	ui := httptest.NewServer(l.svc.AdminHandler())
+	defer ui.Close()
+	d := startBrowser(t, chrome, "test-admin")
 	// All topology states come from the same store and real Agent sessions.
 	l.stop("node-b")
 	for i := 1; i <= 5; i++ {

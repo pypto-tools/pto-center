@@ -169,7 +169,8 @@ function createTopology() {
     const lines = make('span'), name = make('strong', node.name);
     name.title = node.name;
     lines.className = 'node-id';
-    const connection = core ? '中心服务' : (open ? 'Agent' : groupText(node)) + ' · ' + connectionText(node);
+    const connection = core ? ['中心服务', state.centerUpdate?.running].filter(Boolean).join(' · ') :
+        (open ? 'Agent' : groupText(node)) + ' · ' + connectionText(node);
     const subline = make('small', lens?.text || connection);
     subline.title = subline.textContent;
     lines.append(name, subline);
@@ -394,7 +395,7 @@ function createTopology() {
     update(next) {
       state = next;
       // Age can cross the stale threshold even if the server's snapshot has not changed.
-      const signature = JSON.stringify([next.nodes, next.centerStatus, next.centerStatusAt, Math.floor(Date.now() / 15000)]);
+      const signature = JSON.stringify([next.nodes, next.centerStatus, next.centerStatusAt, next.centerUpdate?.running, Math.floor(Date.now() / 15000)]);
       if (signature !== lastState || focusOnShow) { lastState = signature; render(); }
     },
     showHost(name) {
