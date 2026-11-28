@@ -6,14 +6,18 @@ import (
 	"crypto/x509"
 	"errors"
 	"flag"
-	"github.com/pypto-tools/pto-center/internal/agent"
-	f "github.com/pypto-tools/pto-center/internal/localfiles"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/pypto-tools/pto-center/internal/agent"
+	f "github.com/pypto-tools/pto-center/internal/localfiles"
+	p "github.com/pypto-tools/pto-center/protocol/v1"
 )
 
 func main() {
@@ -33,7 +37,14 @@ func run() error {
 	flag.StringVar(&invite, "invite-file", "", "file with enrollment token")
 	flag.BoolVar(&a.Local, "local", false, "allow loopback HTTP")
 	flag.DurationVar(&a.Timeout, "timeout", 2*time.Hour, "maximum time per adapter operation")
+	flag.DurationVar(&a.UpgradeTimeout, "upgrade-timeout", 90*time.Second, "maximum time for a new Agent to reconnect and resume its update")
+	version := flag.Bool("version", false, "print the Agent build version")
+	worker := flag.String("worker", "", "internal supervised worker selection")
 	flag.Parse()
+	if *version {
+		fmt.Println(agent.Version())
+		return nil
+	}
 	if os.Geteuid() == 0 {
 		return errors.New("run pto-agent as a dedicated unprivileged account")
 	}
@@ -50,7 +61,14 @@ func run() error {
 	if invite != "" {
 		raw, err := os.ReadFile(invite)
 		if err != nil {
-			return err
+			if !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+			// A one-use invitation may have been removed after enrollment.
+			key, keyErr := f.ReadLimit(filepath.Join(a.Dir, "credential"), 64)
+			if keyErr != nil || !p.Digest.Match(key) {
+				return err
+			}
 		}
 		a.Invite = strings.TrimSpace(string(raw))
 	}
@@ -68,5 +86,5 @@ func run() error {
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	return a.Run(ctx)
+	return a.RunService(ctx, os.Args[1:], *worker)
 }

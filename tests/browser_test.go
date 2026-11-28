@@ -87,6 +87,9 @@ func TestBrowserBatchConfiguration(t *testing.T) {
 	for _, n := range both {
 		l.add(n, v)
 	}
+	if err := l.store.SetGroups("node-b", []string{"test"}, []string{"User"}); err != nil {
+		t.Fatal(err)
+	}
 	l.run(v, "install", both, nil, nil, "succeeded")
 	// Same store and admin UI. Only this local browser uses an HTTP loopback entry point.
 	ui := httptest.NewServer(l.svc.AdminHandler())
@@ -180,13 +183,141 @@ func TestBrowserBatchConfiguration(t *testing.T) {
 	d := devTools{t: t, conn: conn}
 	d.call("Network.enable", map[string]any{})
 	d.call("Network.setExtraHTTPHeaders", map[string]any{"headers": map[string]string{"Authorization": "Basic " + base64.StdEncoding.EncodeToString([]byte("admin:test-admin"))}})
+	// All topology states come from the same store and real Agent sessions.
+	l.stop("node-b")
+	for i := 1; i <= 5; i++ {
+		if _, err := l.store.Invite(fmt.Sprintf("waiting-%d", i), "pending"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Give the disconnected Agent a deterministic last sample independently of
+	// the test runner's utmp, systemd and login sessions.
+	l.postStatus("node-b", `{"loggedInUsers":0,"services":[{"unit":"worker.service","active":"failed","sub":"failed"},{"unit":"ssh.service","active":"active","sub":"running"}]}`, 204)
+	d.call("Page.navigate", map[string]any{"url": ui.URL + "/"})
+	d.wait(`document.querySelector('#vertices .online[data-name="node-a"]') &&
+		document.querySelector('#vertices .offline[data-name="node-b"]') &&
+		document.querySelector('#vertices .pending[data-name="waiting-5"]') &&
+		document.querySelector('#map').getBoundingClientRect().bottom === innerHeight`)
+	d.eval(`document.querySelector('[data-name="node-b"] .node-toggle').click(); true`)
+	d.wait(`document.querySelector('[data-name="node-b"] .machine-detail').innerText.includes('0 人') &&
+		document.querySelector('[data-name="node-b"] .machine-detail').innerText.includes('离线快照') &&
+		document.querySelector('[data-name="node-b"] .machine-detail').innerText.includes('失败') &&
+		!document.querySelector('[data-name="node-a"] .machine-detail')`)
+	d.eval(`document.querySelector('[data-name="node-b"] .service-open').click(); true`)
+	d.wait(`document.querySelector('dialog').open && document.querySelectorAll('.dialog-services li').length===2`)
+	d.eval(`const units=document.querySelector('#service-search'); units.value='ssh'; units.dispatchEvent(new Event('input')); true`)
+	d.wait(`document.querySelectorAll('.dialog-services li').length===1 && document.querySelector('.dialog-services').textContent.includes('运行中')`)
+	d.eval(`document.querySelector('#close').click(); document.querySelector('[data-name="waiting-5"] .node-toggle').click(); true`)
+	d.wait(`document.querySelector('[data-name="waiting-5"] .machine-detail').innerText.includes('未知') &&
+		document.querySelectorAll('.vertex.expanded').length===2`)
+	d.call("Page.reload", map[string]any{})
+	d.wait(`document.querySelectorAll('.vertex.expanded').length===2 && !!document.querySelector('[data-name="node-b"].expanded')`)
+	d.eval(`document.querySelector('[data-status="offline"]').click(); true`)
+	d.wait(`document.querySelectorAll('.vertex').length===2 && !!document.querySelector('[data-name="node-b"].expanded')`)
+	d.eval(`document.querySelector('[data-status="all"]').click(); const search=document.querySelector('#map-filter'); search.value='no-matching-host';
+		search.dispatchEvent(new Event('input')); true`)
+	d.wait(`document.querySelectorAll('.vertex').length===1 && document.querySelector('#map-count').textContent.includes('没有匹配')`)
+	d.eval(`search.value='node-b'; search.dispatchEvent(new Event('input')); true`)
+	d.wait(`document.querySelectorAll('.vertex').length===2 && !!document.querySelector('[data-name="node-b"] .machine-detail')`)
+	d.call("Emulation.setDeviceMetricsOverride", map[string]any{"width": 390, "height": 844, "deviceScaleFactor": 1, "mobile": true})
+	d.wait(`innerWidth===390 && document.documentElement.scrollWidth<=390 && document.documentElement.scrollHeight<=innerHeight &&
+		document.querySelector('#map').getBoundingClientRect().bottom===innerHeight`)
+	d.eval(`document.querySelector('#map-fit').click();
+		const currentZoom=()=>parseInt(document.querySelector('#zoom-level').value);
+		const initialZoom=currentZoom(); document.querySelector('#zoom-in').click();
+		window.didZoom=currentZoom()>initialZoom; true`)
+	d.wait(`window.didZoom`)
+	d.eval(`document.querySelector('#map-fit').click(); document.querySelector('[data-name="node-b"] .detail-foot a').click(); true`)
+	d.wait(`document.querySelector('nav a[aria-current=page]').hash==='#hosts' && document.querySelector('#fleet-filter').value==='node-b'`)
+	d.eval(`const hostFilter=document.querySelector('#fleet-filter');hostFilter.value='';hostFilter.dispatchEvent(new Event('input'));true`)
+	d.eval(`document.querySelector('[aria-label="node-a 的 Agent 版本记录"]').click();true`)
+	d.wait(`document.querySelector('#dialog-title').innerText==='node-a · Agent 版本记录' && document.querySelector('#dialog-body tbody')?.innerText.includes('linux/')`)
+	d.eval(`document.querySelector('#close').click();true`)
+	d.eval(`document.querySelector('[aria-label="编辑 node-a 的分组"]').click();true`)
+	d.wait(`document.querySelector('dialog').open && !!document.querySelector('.group-editor')`)
+	d.eval(`const editor=document.querySelector('.group-editor');editor.querySelector('input[value="test"]').click();
+		editor.querySelector('.group-entry input').value='CI';editor.querySelector('.group-entry button').click();
+		editor.querySelector('input[value="User"]').click();
+		[...document.querySelectorAll('#dialog-body button')].find(b=>b.textContent==='保存分组').click();true`)
+	d.wait(`!document.querySelector('dialog').open && document.querySelector('#matrix').innerText.includes('CI / User')`)
+	d.eval(`[...document.querySelectorAll('#matrix .host-link')].find(b=>b.textContent==='node-a').click();true`)
+	d.wait(`location.hash==='#fleet' && !!document.querySelector('[data-name="node-a"].expanded')`)
+	d.call("Emulation.clearDeviceMetricsOverride", map[string]any{})
+	l.start("node-b")
+	l.until(func(s center.State) bool {
+		for _, n := range s.Nodes {
+			if n.Name == "node-b" {
+				return n.Online && n.Status != nil
+			}
+		}
+		return false
+	})
+	d.eval(`document.querySelector('#refresh').click();true`)
+	d.wait(`!!document.querySelector('#vertices .online[data-name="node-b"]') &&
+		document.querySelector('[data-name="node-a"] .node-toggle').getAttribute('aria-expanded')==='true'`)
+	d.eval(`const groupToggle=(id,v)=>document.querySelector('#'+id+' input[value="'+v+'"]').click();
+		groupToggle('map-groups','CI');true`)
+	d.wait(`document.querySelectorAll('.vertex').length===2 && !!document.querySelector('[data-name="node-a"]')`)
+	d.eval(`groupToggle('map-groups','User');true`)
+	d.wait(`document.querySelectorAll('.vertex').length===3 && !!document.querySelector('[data-name="node-b"]')`)
+	d.eval(`groupToggle('map-groups','CI');true`)
+	d.wait(`document.querySelectorAll('.vertex').length===3 && !!document.querySelector('[data-name="node-a"]')`)
+	d.eval(`const view=document.querySelector('#map-view');
+		const switchView=v=>{view.value=v;view.dispatchEvent(new Event('change'))};
+		switchView('versions');true`)
+	d.wait(`document.querySelector('[data-name="node-a"] .node-id').innerText.includes('已运行 v1') &&
+		document.querySelector('#view-summary').textContent.includes('2 台')`)
+	d.eval(`switchView('rollouts');document.querySelector('#round-new').click();true`)
+	d.wait(`document.querySelector('dialog').open && document.querySelector('#dialog-body').querySelectorAll('select').length===3`)
+	d.eval(`const dialogBtn=prefix=>[...document.querySelectorAll('#dialog-body button')].find(b=>b.textContent.startsWith(prefix));
+		dialogBtn('预览第一批').click();true`)
+	d.wait(`document.querySelector('#dialog-title').textContent==='确认第一批更新' &&
+		document.querySelector('#dialog-body').innerText.includes('共用')`)
+	d.eval(`dialogBtn('确认发布第一批').click();true`)
+	l.until(func(s center.State) bool {
+		for _, task := range s.Tasks {
+			if len(s.Rollouts) == 1 && task.Node == "node-a" && task.Action == "update" && task.State == "skipped" {
+				return true
+			}
+		}
+		return false
+	})
+	d.eval(`document.querySelector('#refresh').click();true`)
+	d.wait(`document.querySelector('#view-summary').innerText.includes('第一批 1/1') &&
+		document.querySelector('#round-remaining').innerText.includes('1 台')`)
+	d.eval(`document.querySelector('[data-name="node-a"] [data-control="receipt"]').click();true`)
+	d.wait(`document.querySelector('#dialog-title').textContent==='node-a · 更新任务' &&
+		document.querySelector('.receipt-fields').innerText.includes('原始回执') &&
+		/[a-f0-9]{64}/.test(document.querySelector('.receipt-fields').innerText)`)
+	d.eval(`document.querySelector('#close').click();document.querySelector('#round-remaining').click();true`)
+	d.wait(`document.querySelector('#dialog-body').innerText.includes('已计入第一批') && !!dialogBtn('预览第二批')`)
+	d.eval(`dialogBtn('预览第二批').click();true`)
+	d.wait(`document.querySelector('#dialog-title').textContent==='确认第二批更新' &&
+		[...document.querySelectorAll('#dialog-body tbody tr')].filter(tr=>tr.cells[2].textContent==='本次发布').map(tr=>tr.cells[0].textContent).join(',')==='node-b'`)
+	d.eval(`dialogBtn('确认发布第二批').click();true`)
+	l.until(func(s center.State) bool {
+		for _, task := range s.Tasks {
+			if task.Node == "node-b" && task.Action == "update" && task.State == "skipped" {
+				return true
+			}
+		}
+		return false
+	})
+	d.eval(`document.querySelector('#refresh').click();true`)
+	d.wait(`document.querySelector('#view-summary').innerText.includes('第二批 1/1')`)
 	d.call("Page.navigate", map[string]any{"url": ui.URL + "/#tools"})
 	d.wait("document.querySelectorAll('#actions button').length > 0")
-	d.eval(`[...document.querySelectorAll('#actions button')].find(b=>b.textContent==='下发配置').click(); document.querySelector('#targets input').click(); true`)
+	d.eval(`[...document.querySelectorAll('#actions button')].find(b=>b.textContent==='下发配置').click();
+		document.querySelector('#target-groups input[value="CI"]').click(); document.querySelector('#all').click();
+		document.querySelector('#target-groups input[value="User"]').click(); true`)
 	d.eval(`(()=>{const i=document.querySelector('input[aria-label="最大并发数"]');i.value='9';i.dispatchEvent(new Event('input'));document.querySelector('#all').click();return true})()`)
 	d.wait(`document.querySelector('input[aria-label="最大并发数"]').value === '9'`)
+	d.eval(`const targetFilter=document.querySelector('#filter'); targetFilter.value='node-a';targetFilter.dispatchEvent(new Event('input'));true`)
+	d.wait(`document.querySelector('#selection-summary').textContent.includes('1 台在筛选外')`)
+	d.eval(`targetFilter.value='';targetFilter.dispatchEvent(new Event('input'));true`)
 	d.eval(`document.querySelector('#preview').click();true`)
-	d.wait("document.querySelector('dialog').open && document.querySelector('#dialog-body').innerText.includes('4 → 9')")
+	d.wait(`document.querySelector('dialog').open && document.querySelector('#dialog-body').innerText.includes('4 → 9') &&
+		[...document.querySelectorAll('#dialog-body tbody tr')].map(row=>row.cells[0].textContent).sort().join(',')==='node-a,node-b'`)
 	d.eval("document.querySelector('#dialog-body .primary').click(); true")
 	d.wait("location.hash === '#history'")
 	l.until(func(s center.State) bool {
@@ -267,4 +398,40 @@ func TestBrowserBatchConfiguration(t *testing.T) {
 	d.wait("typeof window.finishNewer==='function' && document.querySelector('#older').disabled && document.querySelector('#newer').disabled")
 	d.eval("document.querySelector('#older').click();window.finishNewer();true")
 	d.wait("window.historyCalls===4 && document.querySelector('#history-table').innerText.includes('history-201') && !document.querySelector('#older').disabled")
+
+	l.cliBundle("demo-info", "v1", true)
+	d.eval(`window.fetch=window.realFetch;delete document.hidden;location.hash='hosts';document.querySelector('#refresh').click();true`)
+	d.wait(`state.tools.some(t=>t.manifest.id==='demo-info') && !!document.querySelector('button[aria-label="在 node-a 上运行工作流"]')`)
+	d.eval(`document.querySelector('button[aria-label="在 node-a 上运行工作流"]').click();true`)
+	d.wait(`location.hash==='#workflows' && !document.querySelector('#wf-new').hidden`)
+	d.eval(`document.querySelector('#wf-new').click();document.querySelector('#wf-name').value='向服务器配置';
+	  const wfButton=text=>[...document.querySelectorAll('#dialog-body button')].find(b=>b.textContent===text);
+	  const setStep=(i,id)=>{const s=document.querySelectorAll('.wf-edit-row > select')[i];
+	    s.value=state.tools.find(t=>t.manifest.id===id).digest;s.dispatchEvent(new Event('change'));};
+	  setStep(0,'demo-info');wfButton('添加步骤').click();setStep(1,'demo-service');
+	  const wfField=document.querySelector('.wf-step-config input[aria-label="最大并发数"]');
+	  wfField.value='12';wfField.dispatchEvent(new Event('input'));
+	  document.querySelectorAll('.wf-edit-row')[1].querySelector('button').click();wfButton('保存模板').click();true`)
+	d.wait(`!document.querySelector('dialog').open && document.querySelector('#wf-steps li')?.textContent.startsWith('demo-service') &&
+	  document.querySelector('#wf-steps').innerText.includes('最大并发数 = 12') &&
+	  document.querySelector('#wf-targets input[value="node-a"]')?.checked && !document.querySelector('#wf-start').disabled`)
+	// If the POST reached the center but the browser lost its response, retry the same run.
+	d.eval(`window.fetch=async (...args)=>{const response=await window.realFetch(...args);
+	  if (args[0]==='/api/workflow-run' && args[1]?.method==='POST') {
+	    window.fetch=window.realFetch;throw Error('workflow response lost');
+	  } return response;};
+	  document.querySelector('#wf-start').click();true`)
+	d.wait(`document.querySelector('#notice').innerText.includes('workflow response lost') && !document.querySelector('#wf-start').disabled`)
+	d.eval(`document.querySelector('#wf-start').click();true`)
+	d.wait(`document.querySelector('#wf-run').value.length===64 && document.querySelector('#wf-start').disabled`)
+	var catalog center.WorkflowCatalog
+	if code := l.request("viewer", "GET", "/api/workflows", nil, &catalog); code != 200 || len(catalog.Runs) != 1 {
+		t.Fatal(code, catalog)
+	}
+	l.waitWorkflow(catalog.Runs[0].ID, "node-a", "skipped", "succeeded", "succeeded")
+	d.eval(`document.querySelector('#refresh').click();true`)
+	d.wait(`document.querySelector('#wf-progress').innerText.includes('2/2 步已核实') && document.querySelector('#wf-results').innerText.includes('配置已生效')`)
+	d.eval(`document.querySelector('#wf-edit').click();true`)
+	d.wait(`document.querySelector('.wf-step-config input[aria-label="最大并发数"]').value==='12' &&
+	  document.querySelector('.wf-step-config input[aria-label="最大并发数"]').closest('.field').querySelector('input[type=checkbox]').checked`)
 }

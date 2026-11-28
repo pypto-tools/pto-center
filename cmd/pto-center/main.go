@@ -33,7 +33,7 @@ func main() {
 }
 func run(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: pto-center init | keygen | validate | pack | register | invite | revoke | serve")
+		return errors.New("usage: pto-center init | keygen | validate | pack | pack-agent | register | invite | revoke | serve")
 	}
 	cmd := args[0]
 	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
@@ -44,9 +44,18 @@ func run(args []string) error {
 	pub := fs.String("trust", "", "trusted release public key")
 	output := fs.String("out", "", "signed bundle file")
 	payload := fs.String("payload", "", "release payload path under tool checkout")
+	var agentFiles []string
+	fs.Func("binary", "pto-agent executable (repeat for each Linux architecture)", func(path string) error {
+		agentFiles = append(agentFiles, path)
+		return nil
+	})
 	file := fs.String("file", "", "signed bundle file")
 	name := fs.String("node", "", "node ID")
-	group := fs.String("group", "", "node group")
+	var groups []string
+	fs.Func("group", "node group (repeat for multiple groups)", func(label string) error {
+		groups = append(groups, label)
+		return nil
+	})
 	ui := fs.String("admin", "", "admin IP:port")
 	api := fs.String("nodes", "", "node IP:port")
 	iface := fs.String("interface", "wt0", "NetBird interface")
@@ -74,8 +83,22 @@ func run(args []string) error {
 			return err
 		}
 		return f.Create(filepath.Join(path, "release.pub"), []byte(base64.StdEncoding.EncodeToString(public)+"\n"), 0644)
-	case "validate", "pack":
-		r, err := readRelease(*dir, *version, *payload)
+	case "validate", "pack", "pack-agent":
+		var r p.Release
+		var err error
+		if cmd == "pack-agent" {
+			var binaries [][]byte
+			for _, path := range agentFiles {
+				b, err := f.ReadLimit(path, p.MaxAgentBinary)
+				if err != nil {
+					return err
+				}
+				binaries = append(binaries, b)
+			}
+			r, err = p.NewAgentRelease(*version, binaries)
+		} else {
+			r, err = readRelease(*dir, *version, *payload)
+		}
 		if err != nil {
 			return err
 		}
@@ -83,7 +106,7 @@ func run(args []string) error {
 		if err != nil {
 			return err
 		}
-		if cmd == "pack" {
+		if cmd != "validate" {
 			key, err := f.Key(*private, ed25519.PrivateKeySize)
 			if err != nil {
 				return err
@@ -141,7 +164,7 @@ func run(args []string) error {
 	case "init":
 		return nil
 	case "invite":
-		value, err := store.Invite(*name, *group)
+		value, err := store.Invite(*name, groups...)
 		if err == nil {
 			fmt.Println(value)
 		}
@@ -149,7 +172,7 @@ func run(args []string) error {
 	case "revoke":
 		return store.Revoke(*name)
 	case "register":
-		raw, err := f.ReadLimit(*file, p.MaxBundle)
+		raw, err := f.ReadLimit(*file, p.MaxAgentBundle)
 		if err != nil {
 			return err
 		}
@@ -200,6 +223,7 @@ func serve(al, nl net.Listener, svc *center.Server, cert, key string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	go svc.WatchSources(ctx)
+	go svc.MonitorHost(ctx)
 	errs := make(chan error, 2)
 	start := func(l net.Listener, h http.Handler) *http.Server {
 		s := &http.Server{Handler: h, ReadHeaderTimeout: 8 * time.Second, ReadTimeout: 60 * time.Second, IdleTimeout: 90 * time.Second, MaxHeaderBytes: 16384, TLSConfig: &tls.Config{MinVersion: tls.VersionTLS12}}

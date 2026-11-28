@@ -34,6 +34,9 @@ type Agent struct {
 	TLS                     *tls.Config
 	Local                   bool
 	Timeout                 time.Duration
+	UpgradeTimeout          time.Duration
+	managed                 bool
+	runningBundle           string
 }
 
 func atomicFile(path string, data []byte, mode os.FileMode) error {
@@ -124,7 +127,10 @@ func (a Agent) Run(ctx context.Context) error {
 	delay := time.Second
 	for ctx.Err() == nil {
 		start := time.Now()
-		if err = a.connect(ctx, key); ctx.Err() != nil {
+		if err = a.connect(ctx, key); errors.Is(err, errSwitchAgent) {
+			return err
+		}
+		if ctx.Err() != nil {
 			return nil
 		}
 		if err != nil {
@@ -145,6 +151,16 @@ func (a Agent) Run(ctx context.Context) error {
 	return nil
 }
 func (a Agent) connect(ctx context.Context, key string) error {
+	var trialID string
+	if a.runningBundle != "" {
+		s, err := a.installState()
+		if err != nil {
+			return err
+		}
+		if s.Trial != nil {
+			trialID = s.Trial.Task
+		}
+	}
 	base := strings.TrimRight(a.Base, "/")
 	if a.Invite != "" {
 		body, _ := json.Marshal(map[string]string{"node": a.Name, "invite": a.Invite, "credential": key})
@@ -173,13 +189,27 @@ func (a Agent) connect(ctx context.Context, key string) error {
 	h := http.Header{}
 	h.Set("Authorization", "Bearer "+key)
 	h.Set("X-PTO-Node", a.Name)
+	inv := a.selfInventory()
+	h.Set(p.AgentVersionHeader, inv.Running)
+	h.Set(p.AgentPlatformHeader, inv.Platform)
+	if a.managed {
+		h.Set(p.AgentManagedHeader, "1")
+	}
 	dial := websocket.Dialer{TLSClientConfig: a.TLS, HandshakeTimeout: 15 * time.Second}
-	ws, _, err := dial.DialContext(ctx, u.String(), h)
+	ws, response, err := dial.DialContext(ctx, u.String(), h)
 	if err != nil {
 		return err
 	}
 	defer ws.Close()
 	session, cancel := context.WithCancel(ctx)
+	if response.Header.Get(p.HostStatusHeader) == "1" {
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			a.monitorHost(session, key)
+		}()
+		defer func() { <-done }()
+	}
 	defer cancel()
 	go func() { <-session.Done(); ws.Close() }()
 	ws.SetReadLimit(p.MaxTaskBytes)
@@ -205,6 +235,10 @@ func (a Agent) connect(ctx context.Context, key string) error {
 			return session.Err()
 		case task = <-tasks:
 		}
+		if trialID != "" && task.ID != trialID {
+			return errors.New("center did not resume the pending Agent update")
+		}
+		trialID = ""
 		report := func(event p.Result) error {
 			ws.SetWriteDeadline(time.Now().Add(15 * time.Second))
 			return ws.WriteJSON(boundedReply(p.Reply{ID: task.ID, Result: event}))
@@ -226,7 +260,7 @@ func (a Agent) load(ctx context.Context, key, digest string) (p.Tool, p.Release,
 		return p.Tool{}, b.Release, errors.New("invalid bundle digest")
 	}
 	cache := filepath.Join(a.Dir, "cache", digest+".json")
-	raw, err := os.ReadFile(cache)
+	raw, err := localfiles.ReadLimit(cache, p.MaxAgentBundle)
 	fresh := errors.Is(err, os.ErrNotExist)
 	if fresh {
 		req, err := http.NewRequestWithContext(ctx, "GET", strings.TrimRight(a.Base, "/")+"/bundles/"+digest, nil)
@@ -243,14 +277,14 @@ func (a Agent) load(ctx context.Context, key, digest string) (p.Tool, p.Release,
 		if res.StatusCode != 200 {
 			return p.Tool{}, b.Release, fmt.Errorf("bundle download returned %s", res.Status)
 		}
-		raw, err = io.ReadAll(io.LimitReader(res.Body, p.MaxBundle+1))
+		raw, err = io.ReadAll(io.LimitReader(res.Body, p.MaxAgentBundle+1))
 		if err != nil {
 			return p.Tool{}, b.Release, err
 		}
 	} else if err != nil {
 		return p.Tool{}, b.Release, err
 	}
-	if len(raw) > p.MaxBundle {
+	if len(raw) > p.MaxAgentBundle {
 		return p.Tool{}, b.Release, errors.New("bundle too large")
 	}
 	if err = json.Unmarshal(raw, &b); err != nil {
@@ -262,6 +296,9 @@ func (a Agent) load(ctx context.Context, key, digest string) (p.Tool, p.Release,
 	}
 	if tool.Digest != digest {
 		return tool, b.Release, errors.New("bundle digest mismatch")
+	}
+	if tool.Manifest.ID != p.AgentTool && len(raw) > p.MaxBundle {
+		return tool, b.Release, errors.New("bundle too large")
 	}
 	if fresh {
 		err = atomicFile(cache, raw, 0600)
@@ -318,7 +355,12 @@ func (a Agent) handle(ctx context.Context, key string, t p.Task, emit func(p.Res
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return reply, err
 	}
-	if !started || j.Effect != "change" {
+	if t.Tool == p.AgentTool {
+		reply, err = a.handleSelf(ctx, key, t, path, j, started, emit)
+		if err != nil {
+			return reply, err
+		}
+	} else if !started || j.Effect != "change" {
 		tool, release, loadErr := a.load(ctx, key, t.Bundle)
 		if loadErr != nil {
 			if !started || j.Effect == "read" {
@@ -568,6 +610,9 @@ func (a Agent) execute(ctx context.Context, t p.Task, tool p.Tool, b p.Release, 
 		}
 	}
 	if t.Action == "apply-config" {
+		if t.RequireTargetVersion && (o.Installed != t.Version || o.Running != t.Version) {
+			return end("conflict", "本机安装版本或运行版本已偏离工作流目标")
+		}
 		if t.SchemaVersion != o.SchemaVersion || len(t.Values) == 0 {
 			return end("conflict", "配置版本不匹配")
 		}
@@ -588,6 +633,9 @@ func (a Agent) execute(ctx context.Context, t p.Task, tool p.Tool, b p.Release, 
 		}
 		if err = p.Validate(tool.Schema, candidate); err != nil {
 			return end("failed", "候选配置未通过校验")
+		}
+		if t.RequireTargetVersion && o.HasConfig(t.Values) && o.ConfigIsEffective() {
+			return end("skipped", "所选配置已生效")
 		}
 		check := t
 		check.Action = "validate-config"
@@ -617,10 +665,8 @@ func (a Agent) execute(ctx context.Context, t p.Task, tool p.Tool, b p.Release, 
 			return end("unknown", "执行后读回失败")
 		}
 		if t.Action == "apply-config" && res.Status == "succeeded" {
-			for k, v := range t.Values {
-				if actual, ok := verified.Config[k]; !ok || !p.Same(actual, v) {
-					return end("unknown", "写入结果与读回值不一致")
-				}
+			if !verified.HasConfig(t.Values) {
+				return end("unknown", "写入结果与读回值不一致")
 			}
 			if verified.EffectiveRevision != t.Revision && verified.Activation != "effective" {
 				return end("unknown", "文件已写入，运行配置尚无生效证据")
