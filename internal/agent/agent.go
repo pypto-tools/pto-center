@@ -164,6 +164,7 @@ func (a Agent) connect(ctx context.Context, key string) error {
 	inv := a.selfInventory()
 	h.Set(p.AgentVersionHeader, inv.Running)
 	h.Set(p.AgentPlatformHeader, inv.Platform)
+	h.Set(p.ToolPublisherHeader, "1")
 	if a.managed {
 		h.Set(p.AgentManagedHeader, "1")
 	}
@@ -229,7 +230,32 @@ func (a Agent) connect(ctx context.Context, key string) error {
 	}
 }
 
-func (a Agent) load(ctx context.Context, key, digest string) (p.Tool, p.Release, error) {
+// Both endpoints use the enrolled node's authenticated Center. The publisher
+// record is separate from the package and is authorized for this dispatched digest.
+func (a Agent) getTaskResource(ctx context.Context, key, path string, limit int64) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", strings.TrimRight(a.Base, "/")+path, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+key)
+	req.Header.Set("X-PTO-Node", a.Name)
+	res, err := a.client().Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != 200 {
+		return nil, fmt.Errorf("task resource download returned %s", res.Status)
+	}
+	raw, err := io.ReadAll(io.LimitReader(res.Body, limit+1))
+	if int64(len(raw)) > limit {
+		return nil, errors.New("task resource exceeds limit")
+	}
+	return raw, err
+}
+
+func (a Agent) load(ctx context.Context, key string, t p.Task) (p.Tool, p.Release, error) {
+	digest := t.Bundle
 	var b p.Bundle
 	if !p.Digest.MatchString(digest) {
 		return p.Tool{}, b.Release, errors.New("invalid bundle digest")
@@ -238,21 +264,7 @@ func (a Agent) load(ctx context.Context, key, digest string) (p.Tool, p.Release,
 	raw, err := localfiles.ReadLimit(cache, p.MaxAgentBundle)
 	fresh := errors.Is(err, os.ErrNotExist)
 	if fresh {
-		req, err := http.NewRequestWithContext(ctx, "GET", strings.TrimRight(a.Base, "/")+"/bundles/"+digest, nil)
-		if err != nil {
-			return p.Tool{}, b.Release, err
-		}
-		req.Header.Set("Authorization", "Bearer "+key)
-		req.Header.Set("X-PTO-Node", a.Name)
-		res, err := a.client().Do(req)
-		if err != nil {
-			return p.Tool{}, b.Release, err
-		}
-		defer res.Body.Close()
-		if res.StatusCode != 200 {
-			return p.Tool{}, b.Release, fmt.Errorf("bundle download returned %s", res.Status)
-		}
-		raw, err = io.ReadAll(io.LimitReader(res.Body, p.MaxAgentBundle+1))
+		raw, err = a.getTaskResource(ctx, key, "/bundles/"+digest, p.MaxAgentBundle)
 		if err != nil {
 			return p.Tool{}, b.Release, err
 		}
@@ -265,7 +277,26 @@ func (a Agent) load(ctx context.Context, key, digest string) (p.Tool, p.Release,
 	if err = json.Unmarshal(raw, &b); err != nil {
 		return p.Tool{}, b.Release, err
 	}
-	tool, err := b.Verify(a.Key)
+	var tool p.Tool
+	if t.RepositorySigned {
+		if t.Tool == p.CenterTool || t.Tool == p.AgentTool {
+			return tool, b.Release, errors.New("平台更新需要本机信任的发布密钥")
+		}
+		rawKey, err := a.getTaskResource(ctx, key, "/tool-publishers/"+digest, 2048)
+		if err != nil {
+			return tool, b.Release, err
+		}
+		var publisher p.ToolPublisher
+		if json.Unmarshal(rawKey, &publisher) != nil || publisher.Tool != t.Tool {
+			return tool, b.Release, errors.New("工具发布身份与任务不符")
+		}
+		tool, err = publisher.Verify(b)
+		if err != nil {
+			return tool, b.Release, err
+		}
+	} else {
+		tool, err = b.Verify(a.Key)
+	}
 	if err != nil {
 		return tool, b.Release, err
 	}
@@ -342,7 +373,7 @@ func (a Agent) handle(ctx context.Context, key string, t p.Task, emit func(p.Res
 			return reply, err
 		}
 	} else if !started || j.Effect != "change" {
-		tool, release, loadErr := a.load(ctx, key, t.Bundle)
+		tool, release, loadErr := a.load(ctx, key, t)
 		if loadErr != nil {
 			if !started || j.Effect == "read" {
 				return fail(loadErr)

@@ -32,4 +32,5 @@ jobs:
       - run: node --check internal/center/topology.js
       - run: node --check internal/center/fleet-views.js
       - run: node --check internal/center/workflows.js
+      - run: node --check internal/center/publishers.js
       - run: make build

@@ -116,7 +116,7 @@ func (a Agent) handleSelf(ctx context.Context, key string, t p.Task, path string
 	if s.Trial != nil {
 		return reply("conflict", "另一项 Agent 切换仍在核实")
 	}
-	tool, _, err := a.load(ctx, key, t.Bundle)
+	tool, _, err := a.load(ctx, key, t)
 	if err != nil {
 		return reply("failed", err.Error())
 	}

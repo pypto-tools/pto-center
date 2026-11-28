@@ -40,20 +40,26 @@ var fleetViewsJS []byte
 //go:embed workflows.js
 var workflowsJS []byte
 
+//go:embed publishers.js
+var publishersJS []byte
+
+//go:embed tool-release.yml
+var toolReleaseWorkflow []byte
+
 //go:embed style.css
 var css []byte
 
 type Server struct {
-	Store         *Store
-	Supervised    bool
-	Admin, Viewer string
-	GitHubToken   string
-	transport     http.RoundTripper
-	syncMu        sync.Mutex
-	mu            sync.Mutex
-	peers         map[string]chan struct{}
-	hostStatus    *p.HostStatus
-	hostStatusAt  int64
+	Store           *Store
+	Supervised      bool
+	Admin, Viewer   string
+	GitHubToken     string
+	GitHubTransport http.RoundTripper
+	syncMu          sync.Mutex
+	mu              sync.Mutex
+	peers           map[string]chan struct{}
+	hostStatus      *p.HostStatus
+	hostStatusAt    int64
 }
 
 func New(s *Store, admin, viewer string) *Server {
@@ -150,6 +156,13 @@ func (s *Server) AdminHandler() http.Handler {
 			case "/workflows.js":
 				w.Header().Set("Content-Type", "application/javascript")
 				w.Write(workflowsJS)
+			case "/publishers.js":
+				w.Header().Set("Content-Type", "application/javascript")
+				w.Write(publishersJS)
+			case "/tool-release.yml":
+				w.Header().Set("Content-Type", "text/yaml; charset=utf-8")
+				w.Header().Set("Content-Disposition", `attachment; filename="publish-tool.yml"`)
+				w.Write(toolReleaseWorkflow)
 			case "/api/version":
 				if err := s.Store.db.PingContext(r.Context()); err != nil {
 					problem(w, http.StatusServiceUnavailable, err)
@@ -276,6 +289,41 @@ func (s *Server) AdminHandler() http.Handler {
 			return
 		}
 		switch r.URL.Path {
+		case "/api/tool-publisher", "/api/check-tool-release":
+			if !admin {
+				http.Error(w, "administrator required", 403)
+				return
+			}
+			var info PublisherInfo
+			var err error
+			if r.URL.Path == "/api/tool-publisher" {
+				var in struct {
+					p.ToolPublisher
+					Expected string `json:"expectedFingerprint"`
+				}
+				if err = decode(w, r, &in, 4096); err == nil {
+					info, err = s.Store.setPublisher(in.ToolPublisher, in.Expected)
+				}
+			} else {
+				var in struct {
+					Tool string `json:"tool"`
+				}
+				if err = decode(w, r, &in, 1024); err == nil {
+					info, err = s.checkPublisher(r.Context(), in.Tool, true)
+				}
+			}
+			if err != nil {
+				code := http.StatusBadRequest
+				if errors.Is(err, errPublisherChanged) {
+					code = http.StatusConflict
+				}
+				if errors.Is(err, sql.ErrNoRows) {
+					code = http.StatusNotFound
+				}
+				problem(w, code, err)
+				return
+			}
+			respond(w, 200, info)
 		case "/api/platform-sync":
 			if !admin {
 				http.Error(w, "administrator required", 403)
@@ -488,7 +536,7 @@ func (s *Server) githubDownload(ctx context.Context, address, accept string, lim
 	if s.GitHubToken != "" {
 		req.Header.Set("Authorization", "Bearer "+s.GitHubToken)
 	}
-	client := http.Client{Transport: s.transport, Timeout: 45 * time.Second, CheckRedirect: func(next *http.Request, via []*http.Request) error {
+	client := http.Client{Transport: s.GitHubTransport, Timeout: 45 * time.Second, CheckRedirect: func(next *http.Request, via []*http.Request) error {
 		if !releaseAsset {
 			return http.ErrUseLastResponse
 		}
@@ -565,6 +613,17 @@ func (s *Server) NodeHandler() http.Handler {
 			s.servePeer(w, r, node)
 			return
 		}
+		if digest, ok := strings.CutPrefix(r.URL.Path, "/tool-publishers/"); ok && p.Digest.MatchString(digest) {
+			var meta []byte
+			err := s.Store.db.QueryRow("SELECT meta FROM bundles WHERE digest=? AND EXISTS(SELECT 1 FROM tasks WHERE node=? AND digest=? AND state='dispatched')", digest, node, digest).Scan(&meta)
+			var tool p.Tool
+			if err != nil || json.Unmarshal(meta, &tool) != nil || tool.Publisher == nil {
+				http.NotFound(w, r)
+				return
+			}
+			respond(w, 200, tool.Publisher)
+			return
+		}
 		if digest, ok := strings.CutPrefix(r.URL.Path, "/bundles/"); ok && p.Digest.MatchString(digest) {
 			var raw []byte
 			err := s.Store.db.QueryRow("SELECT raw FROM bundles WHERE digest=? AND EXISTS(SELECT 1 FROM tasks WHERE node=? AND digest=? AND state='dispatched')", digest, node, digest).Scan(&raw)
@@ -636,7 +695,7 @@ func (s *Server) servePeer(w http.ResponseWriter, r *http.Request, node string) 
 			return
 		}
 		if active == nil {
-			t, err := s.Store.next(ctx, node)
+			t, err := s.Store.nextForAgent(ctx, node, r.Header.Get(p.ToolPublisherHeader) == "1")
 			if err == nil {
 				ws.SetWriteDeadline(time.Now().Add(10 * time.Second))
 				if ws.WriteJSON(t) != nil {

@@ -141,7 +141,7 @@ func TestCandidateSyncAndDurableDispatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	candidate := bundle("v2")
-	svc.transport = transportFunc(func(r *http.Request) (*http.Response, error) {
+	svc.GitHubTransport = transportFunc(func(r *http.Request) (*http.Response, error) {
 		if r.URL.Host != "api.github.com" {
 			t.Fatal(r.URL)
 		}
@@ -203,10 +203,10 @@ func TestCandidateSyncAndDurableDispatch(t *testing.T) {
 	}
 	// A manual import happens while the previous generation is fetching contents.
 	svc.Store = store
-	transport := svc.transport
+	transport := svc.GitHubTransport
 	latest, candidate = strings.Repeat("d", 40), bundle("stale")
 	override := strings.Repeat("e", 40)
-	svc.transport = transportFunc(func(r *http.Request) (*http.Response, error) {
+	svc.GitHubTransport = transportFunc(func(r *http.Request) (*http.Response, error) {
 		if strings.Contains(r.URL.Path, "/contents/") {
 			if _, err := svc.registerSource(bundle("manual"), repo, override, "bundle.json", nil); err != nil {
 				t.Fatal(err)
