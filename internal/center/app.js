@@ -409,8 +409,13 @@ async function switchCenter(action) {
   try {
     const result = await api('center-update', centerRequest);
     centerRequest = undefined;
-    el('center-result').textContent = result.summary;
-    await refresh();
+    state.centerUpdate.last = result;
+    renderCenterUpdate();
+    try {
+      await refresh();
+    } catch (e) {
+      notice('中心切换请求已受理，刷新状态失败：' + e.message);
+    }
   } finally {
     centerSending = false;
     renderCenterUpdate();
