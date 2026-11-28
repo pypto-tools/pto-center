@@ -13,6 +13,7 @@ test:
 	node --check internal/center/topology.js
 	node --check internal/center/fleet-views.js
 	node --check internal/center/workflows.js
+	node --check internal/center/publishers.js
 
 demo: build
 	bash scripts/demo.sh

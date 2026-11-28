@@ -359,6 +359,7 @@ async function refresh() {
   document.querySelectorAll('.admin').forEach(
       e => e.hidden = state.role !== 'admin');
   renderCenterUpdate();
+  publisherPage.render(state.publishers || [], state.role === 'admin');
   const old = el('tool').value;
   el('tool').replaceChildren();
   for (const t of state.tools) {
@@ -873,6 +874,7 @@ el('center-upgrade').onclick = () => tryRun(() => switchCenter('update'));
 el('center-rollback').onclick = () => tryRun(() => switchCenter('rollback'));
 el('refresh').onclick = () => tryRun(() => refresh());
 el('close').onclick = () => el('dialog').close();
+el('new-publisher').onclick = () => publisherPage.open();
 el('preview').onclick = () => tryRun(preview);
 el('tool').onchange = chooseTool;
 el('filter').oninput = targets;

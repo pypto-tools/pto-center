@@ -70,6 +70,9 @@ func Open(dir string, key ed25519.PublicKey) (*Store, error) {
  CREATE TABLE IF NOT EXISTS workflow_runs(seq INTEGER PRIMARY KEY,id TEXT NOT NULL UNIQUE,snapshot BLOB NOT NULL,nodes BLOB NOT NULL,actor TEXT NOT NULL,created INTEGER NOT NULL);
  CREATE TABLE IF NOT EXISTS workflow_tasks(run TEXT NOT NULL,node TEXT NOT NULL,step INTEGER NOT NULL,task TEXT NOT NULL UNIQUE,verified INTEGER NOT NULL DEFAULT 0,note TEXT NOT NULL DEFAULT '',PRIMARY KEY(run,node,step));
  CREATE TABLE IF NOT EXISTS sources(repo TEXT NOT NULL,path TEXT NOT NULL,tool TEXT NOT NULL,revision TEXT NOT NULL,checked INTEGER NOT NULL,message TEXT NOT NULL,PRIMARY KEY(repo,path));
+ CREATE TABLE IF NOT EXISTS tool_publishers(tool TEXT PRIMARY KEY,repo TEXT NOT NULL,key BLOB NOT NULL UNIQUE,
+   state TEXT NOT NULL DEFAULT 'pending',checked INTEGER NOT NULL DEFAULT 0,message TEXT NOT NULL DEFAULT '',
+   version TEXT NOT NULL DEFAULT '',digest TEXT NOT NULL DEFAULT '',asset_hash TEXT NOT NULL DEFAULT '');
  `)
 	if err != nil {
 		db.Close()
@@ -191,6 +194,10 @@ func (s *Store) Register(raw []byte) (p.Tool, error) {
 // expected is the source row read before a background fetch. Use its identity
 // inside the same transaction as bundle registration, automatic probes and import.
 func (s *Store) register(raw []byte, source, expected *SourceRecord) (p.Tool, error) {
+	return s.registerChecked(raw, source, expected, nil)
+}
+
+func (s *Store) registerChecked(raw []byte, source, expected *SourceRecord, check *publisherCheck) (p.Tool, error) {
 	var bundle p.Bundle
 	if len(raw) > p.MaxAgentBundle {
 		return p.Tool{}, errors.New("bundle exceeds limit")
@@ -198,21 +205,18 @@ func (s *Store) register(raw []byte, source, expected *SourceRecord) (p.Tool, er
 	if err := json.Unmarshal(raw, &bundle); err != nil {
 		return p.Tool{}, err
 	}
-	tool, err := bundle.Verify(s.key)
+	tx, err := s.db.Begin()
 	if err != nil {
-		return tool, err
+		return p.Tool{}, err
 	}
-	if tool.Manifest.ID != p.AgentTool && tool.Manifest.ID != p.CenterTool && len(raw) > p.MaxBundle {
-		return tool, errors.New("bundle exceeds limit")
+	defer tx.Rollback()
+	tool, err := s.verifyIncoming(tx, bundle, len(raw), check)
+	if err != nil {
+		return p.Tool{}, err
 	}
 	if source != nil && (!strings.EqualFold(source.Repository, tool.Manifest.Source.Repository) || (expected != nil && expected.Tool != tool.Manifest.ID)) {
 		return p.Tool{}, errors.New("signed tool or source repository mismatch")
 	}
-	tx, err := s.db.Begin()
-	if err != nil {
-		return tool, err
-	}
-	defer tx.Rollback()
 	if expected != nil {
 		var id int64
 		var revision string
@@ -226,6 +230,13 @@ func (s *Store) register(raw []byte, source, expected *SourceRecord) (p.Tool, er
 	if err = registerBundle(tx, raw, tool); err != nil {
 		return tool, err
 	}
+	if check != nil {
+		_, err = tx.Exec("UPDATE tool_publishers SET state='verified',checked=?,message='',version=?,digest=?,asset_hash=? WHERE tool=?",
+			time.Now().Unix(), tool.Version, tool.Digest, p.Hash(raw), tool.Manifest.ID)
+		if err != nil {
+			return tool, err
+		}
+	}
 	if source != nil {
 		_, err = tx.Exec("INSERT OR REPLACE INTO sources(repo,path,tool,revision,checked,message) VALUES(?,?,?,?,?,?)", source.Repository, source.Path, tool.Manifest.ID, source.Commit, time.Now().Unix(), "已同步")
 		if err != nil {
@@ -237,10 +248,18 @@ func (s *Store) register(raw []byte, source, expected *SourceRecord) (p.Tool, er
 
 func registerBundle(tx *sql.Tx, raw []byte, tool p.Tool) error {
 	var id string
-	err := tx.QueryRow("SELECT digest FROM bundles WHERE tool=? AND version=?", tool.Manifest.ID, tool.Version).Scan(&id)
+	var existing []byte
+	err := tx.QueryRow("SELECT digest,meta FROM bundles WHERE tool=? AND version=?", tool.Manifest.ID, tool.Version).Scan(&id, &existing)
 	if err == nil {
 		if id != tool.Digest {
 			return errors.New("version already identifies another release")
+		}
+		var prior p.Tool
+		if err := json.Unmarshal(existing, &prior); err != nil {
+			return err
+		}
+		if !samePublisher(prior.Publisher, tool.Publisher) {
+			return errors.New("该版本已使用另一把密钥注册，请发布新版本")
 		}
 		return nil
 	}
@@ -333,20 +352,24 @@ type Record struct {
 	Result  *p.Result `json:"result,omitempty"`
 }
 type State struct {
-	CenterStatus   *p.HostStatus `json:"centerStatus,omitempty"`
-	CenterStatusAt int64         `json:"centerStatusAt,omitempty"`
-	Nodes          []Node        `json:"nodes"`
-	Tools          []p.Tool      `json:"tools"`
-	Inventory      []Observation `json:"inventory"`
-	Tasks          []Record      `json:"tasks"`
-	MoreTasks      bool          `json:"moreTasks"`
-	Rollouts       []RolloutInfo `json:"rollouts"`
+	Publishers     []PublisherInfo `json:"publishers"`
+	CenterStatus   *p.HostStatus   `json:"centerStatus,omitempty"`
+	CenterStatusAt int64           `json:"centerStatusAt,omitempty"`
+	Nodes          []Node          `json:"nodes"`
+	Tools          []p.Tool        `json:"tools"`
+	Inventory      []Observation   `json:"inventory"`
+	Tasks          []Record        `json:"tasks"`
+	MoreTasks      bool            `json:"moreTasks"`
+	Rollouts       []RolloutInfo   `json:"rollouts"`
 }
 
 func (s *Store) State() (State, error) {
 	out := State{Nodes: []Node{}, Inventory: []Observation{}, Tasks: []Record{}}
 	var err error
 	if out.Tools, err = s.tools(); err != nil {
+		return out, err
+	}
+	if out.Publishers, err = s.publishers(); err != nil {
 		return out, err
 	}
 	rows, err := s.db.Query(`SELECT name,` + nodeGroupsJSON + `,seen,credential<>'',COALESCE(h.received,0),h.raw
@@ -462,7 +485,7 @@ type Plan struct {
 }
 
 func newTask(node string, tool p.Tool, action string) p.Task {
-	return p.Task{ID: Token(), Node: node, Tool: tool.Manifest.ID, Bundle: tool.Digest, Version: tool.Version, Action: action, SchemaVersion: tool.Manifest.ConfigSchemaVersion}
+	return p.Task{ID: Token(), Node: node, Tool: tool.Manifest.ID, Bundle: tool.Digest, Version: tool.Version, Action: action, SchemaVersion: tool.Manifest.ConfigSchemaVersion, RepositorySigned: tool.Publisher != nil}
 }
 func registeredTool(tx *sql.Tx, digest string) (p.Tool, error) {
 	var raw []byte
@@ -772,6 +795,10 @@ func predecessorBaseline(tx *sql.Tx, task p.Task, field string) (p.Values, error
 	return baseline, err
 }
 func (s *Store) next(ctx context.Context, node string) (p.Task, error) {
+	return s.nextForAgent(ctx, node, true)
+}
+
+func (s *Store) nextForAgent(ctx context.Context, node string, supportsPublishers bool) (p.Task, error) {
 	var t p.Task
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -796,6 +823,12 @@ func (s *Store) next(ctx context.Context, node string) (p.Task, error) {
 			return t, err
 		}
 		var rejected p.Result
+		if t.RepositorySigned && !supportsPublishers {
+			rejected = p.Result{Status: "failed", Summary: "请先升级 Agent，再派发使用仓库密钥的工具版本"}
+			if state == "dispatched" {
+				rejected.Status = "unknown"
+			}
+		}
 		if err := checkAgentTarget(tx, t); err != nil {
 			if !errors.Is(err, errAgentTarget) {
 				return t, err

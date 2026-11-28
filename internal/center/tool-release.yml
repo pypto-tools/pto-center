@@ -1,0 +1,83 @@
+# Copy to .github/workflows/publish-tool.yml in the tool repository.
+name: Publish signed PTO tool
+on:
+  push:
+    tags: ['v*']
+
+concurrency:
+  group: publish-tool-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+    env:
+      TOOL_DIR: pto-center
+      # Path relative to TOOL_DIR. Set this when the adapter installs a bundled program.
+      PTO_PAYLOAD: ''
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Install the compatible pack CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            x86_64) arch=amd64; sha=8a2d9f42fdbbb812107a310dd55f75bb5ef9b3ebe718cde4bc31dab4bda0043c ;;
+            aarch64|arm64) arch=arm64; sha=62d69f703fec1ac483ec4e128ac2c77eff857023b748c749e4412c745eb791e3 ;;
+            *) echo "Unsupported runner architecture" >&2; exit 1 ;;
+          esac
+          dir=$(mktemp -d)
+          cd "$dir"
+          asset="pto-center-v0.1.0-linux-$arch.tar.gz"
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --retry 3 \
+            --output "$asset" "https://github.com/pypto-tools/pto-center/releases/download/v0.1.0/$asset"
+          printf '%s  %s\n' "$sha" "$asset" | sha256sum --check -
+          tar -xzf "$asset" bin/pto-center
+          echo "$dir/bin" >> "$GITHUB_PATH"
+      # Build your tool here if PTO_PAYLOAD refers to a generated file.
+      - name: Sign package
+        env:
+          PTO_SIGNING_KEY: ${{ secrets.PTO_SIGNING_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          key=$(mktemp)
+          trap 'rm -f -- "$key"' EXIT
+          : "${PTO_SIGNING_KEY:?Set PTO_SIGNING_KEY in the release environment}"
+          printf '%s\n' "$PTO_SIGNING_KEY" > "$key"
+          unset PTO_SIGNING_KEY
+          tool=$(jq -er '.id' "$TOOL_DIR/pto-tool.json")
+          repo=$(jq -er '.source.repository' "$TOOL_DIR/pto-tool.json")
+          [[ $tool =~ ^[a-z][a-z0-9-]{0,62}$ && ${repo,,} == ${GITHUB_REPOSITORY,,} ]]
+          [[ $tool != pto-agent && $tool != pto-center ]]
+          [[ $GITHUB_REF_NAME =~ ^v[A-Za-z0-9._+-]{0,99}$ ]]
+          asset="$tool-$GITHUB_REF_NAME.json"
+          pto-center pack --dir "$TOOL_DIR" --version "$GITHUB_REF_NAME" --payload "$PTO_PAYLOAD" --signing-key "$key" --out "$RUNNER_TEMP/$asset"
+          echo "PTO_ASSET=$asset" >> "$GITHUB_ENV"
+      - name: Publish Release attachment
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag=$GITHUB_REF_NAME
+          file="$RUNNER_TEMP/$PTO_ASSET"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json tagName >/dev/null 2>&1; then
+            # A retry may reuse identical bytes. A published version is immutable.
+            existing=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
+            if grep -Fxq -- "$PTO_ASSET" <<< "$existing"; then
+              tmp=$(mktemp -d)
+              gh release download "$tag" --repo "$GITHUB_REPOSITORY" -p "$PTO_ASSET" -D "$tmp"
+              cmp "$file" "$tmp/$PTO_ASSET"
+            else
+              gh release upload "$tag" "$file" --repo "$GITHUB_REPOSITORY"
+            fi
+          else
+            gh release create "$tag" "$file" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes
+          fi

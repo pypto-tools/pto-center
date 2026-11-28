@@ -13,40 +13,65 @@ import (
 	p "github.com/pypto-tools/pto-center/protocol/v1"
 )
 
+type githubAsset struct {
+	ID     int64
+	Name   string
+	Digest string
+}
+
+type githubRelease struct {
+	Tag               string `json:"tag_name"`
+	Draft, Prerelease bool
+	Assets            []githubAsset
+}
+
+func (s *Server) latestRelease(ctx context.Context, repo string) (githubRelease, error) {
+	var release githubRelease
+	if !repoName.MatchString(repo) {
+		return release, errors.New("无效的 GitHub 仓库")
+	}
+	raw, err := s.github(ctx, "https://api.github.com/repos/"+repo+"/releases/latest", "application/vnd.github+json", 2<<20)
+	if err != nil {
+		return release, err
+	}
+	if json.Unmarshal(raw, &release) != nil || release.Draft || release.Prerelease || !strings.HasPrefix(release.Tag, "v") || !p.Version.MatchString(release.Tag) {
+		return release, errors.New("GitHub 未返回有效的正式版本")
+	}
+	return release, nil
+}
+
+func (r githubRelease) asset(tool string) (githubAsset, error) {
+	name := tool + "-" + r.Tag + ".json"
+	for _, asset := range r.Assets {
+		if asset.Name == name && asset.ID > 0 {
+			return asset, nil
+		}
+	}
+	return githubAsset{}, fmt.Errorf("发行版缺少 %s", name)
+}
+
+func (s *Server) releaseAsset(ctx context.Context, repo string, asset githubAsset, limit int64) ([]byte, error) {
+	return s.githubDownload(ctx, "https://api.github.com/repos/"+repo+"/releases/assets/"+strconv.FormatInt(asset.ID, 10), "application/octet-stream", limit, true)
+}
+
 // Register the two artifacts of one published platform version atomically.
 // Downloading and registering a release never dispatches an update.
 func (s *Server) syncPlatformRelease(ctx context.Context) ([]p.Tool, error) {
 	s.syncMu.Lock()
 	defer s.syncMu.Unlock()
-	const releases = "https://api.github.com/repos/pypto-tools/pto-center/releases"
-	raw, err := s.github(ctx, releases+"/latest", "application/vnd.github+json", 2<<20)
+	const repo = "pypto-tools/pto-center"
+	release, err := s.latestRelease(ctx, repo)
 	if err != nil {
 		return nil, err
-	}
-	var release struct {
-		Tag               string `json:"tag_name"`
-		Draft, Prerelease bool
-		Assets            []struct {
-			ID   int64
-			Name string
-		}
-	}
-	if json.Unmarshal(raw, &release) != nil || release.Draft || release.Prerelease || !strings.HasPrefix(release.Tag, "v") || !p.Version.MatchString(release.Tag) {
-		return nil, errors.New("GitHub 未返回有效的正式平台版本")
-	}
-	assets := map[string]int64{}
-	for _, a := range release.Assets {
-		assets[a.Name] = a.ID
 	}
 	var tools []p.Tool
 	var files [][]byte
 	for _, name := range []string{p.CenterTool, p.AgentTool} {
-		filename := name + "-" + release.Tag + ".json"
-		id := assets[filename]
-		if id <= 0 {
-			return nil, fmt.Errorf("发行版缺少 %s", filename)
+		asset, err := release.asset(name)
+		if err != nil {
+			return nil, err
 		}
-		raw, err := s.githubDownload(ctx, releases+"/assets/"+strconv.FormatInt(id, 10), "application/octet-stream", p.MaxAgentBundle, true)
+		raw, err := s.releaseAsset(ctx, repo, asset, p.MaxAgentBundle)
 		if err != nil {
 			return nil, err
 		}
@@ -59,7 +84,7 @@ func (s *Server) syncPlatformRelease(ctx context.Context) ([]p.Tool, error) {
 			return nil, err
 		}
 		if tool.Manifest.ID != name || tool.Version != release.Tag {
-			return nil, fmt.Errorf("%s 的签名内容与组件或标签不符", filename)
+			return nil, fmt.Errorf("%s 的签名内容与组件或标签不符", asset.Name)
 		}
 		tools, files = append(tools, tool), append(files, raw)
 	}
@@ -74,6 +99,64 @@ func (s *Server) syncPlatformRelease(ctx context.Context) ([]p.Tool, error) {
 		}
 	}
 	return tools, tx.Commit()
+}
+
+// Verification status is about an observed GitHub release. A successful local
+// upload alone cannot prove that the repository's release workflow is working.
+func (s *Server) checkPublisher(ctx context.Context, tool string, force bool) (PublisherInfo, error) {
+	s.syncMu.Lock()
+	defer s.syncMu.Unlock()
+	k, err := readPublisher(s.Store.db.QueryRow("SELECT "+publisherCols+" FROM tool_publishers WHERE tool=?", tool))
+	if err != nil {
+		return k, err
+	}
+	err = s.checkPublisherRelease(ctx, k, force)
+	if err != nil {
+		if ctx.Err() != nil {
+			return k, ctx.Err()
+		}
+		message := err.Error()
+		var networkError *url.Error
+		if errors.As(err, &networkError) {
+			// Redirect URLs may contain temporary download credentials.
+			message = "无法从 GitHub 下载发布包，请检查网络、代理或下载地址"
+		}
+		result, dbErr := s.Store.db.Exec("UPDATE tool_publishers SET state='failed',checked=?,message=? WHERE tool=? AND key=?", time.Now().Unix(), message, k.Tool, k.PublicKey)
+		if dbErr != nil {
+			return k, dbErr
+		}
+		if count, dbErr := result.RowsAffected(); dbErr != nil || count != 1 {
+			return k, errPublisherChanged
+		}
+	}
+	return readPublisher(s.Store.db.QueryRow("SELECT "+publisherCols+" FROM tool_publishers WHERE tool=? AND key=?", tool, k.PublicKey))
+}
+
+func (s *Server) checkPublisherRelease(ctx context.Context, k PublisherInfo, force bool) error {
+	r, err := s.latestRelease(ctx, k.Repository)
+	if err != nil {
+		return err
+	}
+	a, err := r.asset(k.Tool)
+	if err != nil {
+		return err
+	}
+	if !force && k.Version == r.Tag && k.assetHash != "" && a.Digest == "sha256:"+k.assetHash {
+		_, err = s.Store.db.Exec("UPDATE tool_publishers SET state='verified',checked=?,message='' WHERE tool=? AND key=?", time.Now().Unix(), k.Tool, k.PublicKey)
+		return err
+	}
+	raw, err := s.releaseAsset(ctx, k.Repository, a, p.MaxBundle)
+	if err != nil {
+		return err
+	}
+	if a.Digest != "" && a.Digest != "sha256:"+p.Hash(raw) {
+		return errors.New("发布附件与 GitHub 返回的摘要不一致")
+	}
+	_, err = s.Store.registerChecked(raw, nil, nil, &publisherCheck{k.ToolPublisher, r.Tag})
+	if err == nil {
+		s.wake()
+	}
+	return err
 }
 
 type SourceRecord struct {
@@ -168,6 +251,13 @@ func (s *Server) WatchSources(ctx context.Context) {
 			return
 		case <-ticker.C:
 			_, _ = s.Sync(ctx)
+			publishers, _ := s.Store.publishers()
+			for _, k := range publishers {
+				if ctx.Err() != nil {
+					return
+				}
+				_, _ = s.checkPublisher(ctx, k.Tool, false)
+			}
 		}
 	}
 }

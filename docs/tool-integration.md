@@ -14,9 +14,19 @@
 
 工具维护者把清单、适配器、可选配置 Schema 和待安装程序一起签名。Shell 或 Python 工具可以把多个运行文件归档为 `tar.gz`，通过 `pto-center pack --payload` 放进签名 JSON。仅用于盘点或配置已有安装的适配器可以单独发包。安装、升级、激活和回退的具体操作由各工具实现，只在清单中声明已支持的动作。[打包命令示例](#打包并注册示例版本)
 
-推荐将签名 JSON 作为 GitHub Release 附件，与标签和变更说明一起保留。目前管理员可下载附件，在 Center 的「工具与配置 → 注册发布包」上传文件。要让 Center 自动同步后续版本，发布者将同一份签名 JSON 提交到工具仓库默认分支的固定路径，由管理员首次登记该来源。直接发现 GitHub Release 附件属于后续功能。[注册与同步操作](running.md#生成和注册工具包)
+各工具可以把签名 JSON 放在自己仓库的 GitHub Release，由 Center 定期验签并登记。同一份包也可以手动上传，或从已登记的仓库文件路径同步。[配置发布密钥和工作流](#从-github-actions-独立发版)
 
 注册成功后，新版本出现在工具目录。管理员在网页上选定版本和目标机器并下发任务，或运行固定了该版本的工作流。Agent 优先使用本机已验证的包，缺包时通过 NetBird 按摘要从 Center 取包并验签，再调用适配器。验收时核对已安装版本和实际运行版本。首批试点计划用 `pto-system-doctor` 验证安装、升级和回退，`npu-taskqueue` 接入升级时要保留原生的更新预约和队列空闲检查。[试点范围与进度](running.md#试点验证)
+
+### 从 GitHub Actions 独立发版
+
+1. 管理员在 Center 的「工具与配置 → 工具发布密钥 → 接入工具」填写清单中的工具 ID 和 GitHub 仓库（如 `pypto-tools/pto-system-doctor`）。点「生成工具密钥」。浏览器使用 Web Crypto 在本机生成 Ed25519 密钥对。已有一套签名流水线时，可直接选择「登记已有公钥」，用于让多个 Center 信任同一工具。
+2. 打开该工具仓库的 `Settings → Environments`，创建或选择名为 `release` 的环境，将刚生成的私钥保存为环境 Secret `PTO_SIGNING_KEY`。回到 Center，勾选「我已保存私钥」，点「登记公钥」。此时状态为「待验证发布包」。Center 只接收公钥，关闭窗口后私钥无法从 Center 取回。在不支持 Ed25519 Web Crypto 的浏览器上，可用 CLI 的 `pto-center keygen --dir <新目录>` 生成同一格式的密钥，再登记 `release.pub`。[GitHub 环境 Secret 设置](https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/use-secrets#creating-secrets-for-an-environment)
+3. 下载同一面板的「发布工作流」，放入工具仓库的 `.github/workflows/publish-tool.yml`。模板默认从 `pto-center/pto-tool.json` 读取清单。按需修改 `TOOL_DIR`，把 `PTO_PAYLOAD` 设为该目录内的程序或归档相对路径。如果安装包需要编译，在模板标注处加入该仓库的构建步骤。仅分发适配器时可留空。[下载工作流源文件](../internal/center/tool-release.yml)
+4. 从任意开发机推送版本标签，例如 `v1.2.0`。Actions 读取该仓库的 Secret，用兼容的 `pto-center pack` 签出 `<工具ID>-v1.2.0.json`，作为该标签的 GitHub Release 附件。已有正式 Release 时会补充附件；已有草稿时会将附件加入草稿，待仓库发布者将其公开。重试遇到同名附件会比较内容。已用过的版本号应继续对应同一份包。
+5. 在 Center 点击该工具的「验证 GitHub 发布」，或等待下一次自动检查（每 15 分钟）。Center 读取最新正式 Release，核对标签、附件、签名、清单工具 ID 和仓库后登记版本。页面显示「签名已验证」、版本和检查时间；失败会显示原因，并保留最近验签通过的版本。Center 使用 Release 附件证明流水线能产出受信包，GitHub Secret 的值仅保存在仓库发布环境。登记后可在「工具与配置」或「安装工作流」选择目标主机，运行结果见「发布记录」。
+
+先部署支持工具公钥的 Center 和 Agent。原 `v0.1.0` Agent 需要先升级，旧平台签名的已登记版本仍可使用。工具密钥丢失时，管理员在「密钥详情 → 更换发布密钥」生成新密钥，更新 GitHub Secret 后登记。请使用新标签发布；历史已登记版本按原签名继续可用。平台 Center 和 Agent 自身升级始终使用部署时的受信平台公钥。
 
 ### 自动化安装的三个阶段
 

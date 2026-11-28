@@ -86,11 +86,37 @@ type Bundle struct {
 	Signature []byte  `json:"signature"`
 }
 type Tool struct {
-	Manifest  Manifest `json:"manifest"`
-	Version   string   `json:"version"`
-	Schema    Values   `json:"schema,omitempty"`
-	Digest    string   `json:"digest"`
-	Platforms []string `json:"platforms,omitempty"`
+	Manifest  Manifest       `json:"manifest"`
+	Version   string         `json:"version"`
+	Schema    Values         `json:"schema,omitempty"`
+	Digest    string         `json:"digest"`
+	Platforms []string       `json:"platforms,omitempty"`
+	Publisher *ToolPublisher `json:"publisher,omitempty"`
+}
+
+// ToolPublisher is an administrator-approved binding, supplied by the
+// authenticated Center separately from the release being verified.
+type ToolPublisher struct {
+	Tool       string `json:"tool"`
+	Repository string `json:"repository"`
+	PublicKey  []byte `json:"publicKey"`
+}
+
+const ToolPublisherHeader = "X-PTO-Tool-Publishers"
+
+func (k ToolPublisher) Verify(b Bundle) (Tool, error) {
+	if !Name.MatchString(k.Tool) || k.Tool == AgentTool || k.Tool == CenterTool {
+		return Tool{}, errors.New("平台组件不能使用工具发布密钥")
+	}
+	tool, err := b.Verify(k.PublicKey)
+	if err != nil {
+		return Tool{}, err
+	}
+	if tool.Manifest.ID != k.Tool || !strings.EqualFold(tool.Manifest.Source.Repository, k.Repository) {
+		return Tool{}, errors.New("签名包的工具或仓库与登记的公钥不符")
+	}
+	tool.Publisher = &k
+	return tool, nil
 }
 
 func Hash(b []byte) string { h := sha256.Sum256(b); return hex.EncodeToString(h[:]) }
@@ -305,6 +331,7 @@ type Task struct {
 	SchemaVersion        int    `json:"configSchemaVersion,omitempty"`
 	Revision             int64  `json:"configRevision,omitempty"`
 	RequireTargetVersion bool   `json:"requireTargetVersion,omitempty"`
+	RepositorySigned     bool   `json:"repositorySigned,omitempty"`
 }
 type Inventory struct {
 	Presence          string   `json:"presence"`

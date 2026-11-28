@@ -26,6 +26,7 @@ make demo
 | 让自己的工具进入可安装列表，增加配置字段或操作按钮 | [工具仓库接入指南](docs/tool-integration.md) |
 | 让网页显示安装卡在哪一步、失败原因是什么 | [上报环境检查、安装和验收状态](docs/tool-integration.md#上报安装阶段) |
 | 为自己的服务发布新版本，决定哪些变更需要重新发包 | [受管服务发包准则](docs/tool-integration.md#受管服务发包准则) |
+| 为工具生成发布密钥，由 GitHub Actions 独立发包 | [接入工具仓库](docs/tool-integration.md#从-github-actions-独立发版) · [发布工作流模板](internal/center/tool-release.yml) |
 | 登记签名包并同步 GitHub 上的新版本 | [生成和注册工具包](docs/running.md#生成和注册工具包) |
 | 查看 Agent 版本记录、分批自升级或回退 | [管理 Agent 自身的版本](docs/running.md#管理-agent-自身的版本) |
 

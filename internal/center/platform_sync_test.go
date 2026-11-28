@@ -52,7 +52,7 @@ func TestOfficialPlatformSyncVerifiesBothAssets(t *testing.T) {
 	}
 	first, second := build(p.CenterTool, p.NewCenterRelease), build(p.AgentTool, p.NewAgentRelease)
 	ok := false
-	svc.transport = transportFunc(func(r *http.Request) (*http.Response, error) {
+	svc.GitHubTransport = transportFunc(func(r *http.Request) (*http.Response, error) {
 		res := &http.Response{StatusCode: 200, Header: http.Header{}}
 		var b []byte
 		switch r.URL.Path {

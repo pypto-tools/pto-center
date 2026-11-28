@@ -8,6 +8,7 @@
     <script defer src="/topology.js"></script>
     <script defer src="/fleet-views.js"></script>
     <script defer src="/workflows.js"></script>
+    <script defer src="/publishers.js"></script>
     <script defer src="/app.js"></script>
   </head>
   <body>
@@ -103,6 +104,14 @@
             <button id="center-rollback" class="admin" hidden>回退到所选版本</button>
             <span id="center-result" role="status"></span>
           </div>
+        </div>
+        <div class="panel" id="tool-publishers">
+          <div class="panel-head"><h2>工具发布密钥</h2>
+            <div><a href="/tool-release.yml" download="publish-tool.yml">下载发布工作流</a>
+              <button type="button" id="new-publisher" class="admin" hidden>接入工具</button></div>
+          </div>
+          <p class="empty" id="publisher-empty">尚未登记工具公钥。接入工具后，可在这里验证它的 GitHub Release。</p>
+          <div class="scroll"><table id="publisher-list" aria-label="工具的发布身份与验签结果" hidden></table></div>
         </div>
         <div class="panel picker">
           <label for="tool">工具及发布版本</label>
