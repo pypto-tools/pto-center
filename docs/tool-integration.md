@@ -32,6 +32,21 @@
 
 Agent 在 `probe` 判定工具尚未安装时会跳过自定义动作。如果要在网页上给这类主机单独下发「仅检查环境」，需要给协议和派发逻辑增加对应动作。
 
+### 上报安装阶段
+
+`install` 适配器通过 stdout 输出逐行 JSON，每行立即刷新。用顶层 `status: "progress"` 报告进度，用 `phases` 中的一个条目报告当前阶段。新接入的工具应依次上报 `preflight`（环境检查）和 `install`（执行安装），阶段开始用 `running`，结束用 `succeeded` 或 `failed`。整个动作最后只输出一条顶层终态，并以退出码 0 表示回执已完整交付。适配器可在最后一条回执里同时给出最后一个阶段的结果。
+
+例如，新机缺少服务依赖的 Python 3 时，安装入口输出下面两行后结束。网页会显示环境检查失败、缺少的依赖和原因码，后两阶段显示「未执行」。
+
+```jsonl
+{"status":"progress","summary":"检查运行时和目录权限","phases":{"preflight":{"state":"running"}}}
+{"status":"failed","summary":"缺少 Python 3","phases":{"preflight":{"state":"failed","code":"missing_dependency"}}}
+```
+
+环境检查通过时，先上报 `preflight.succeeded`，再上报 `install.running`，最后报告安装入口的结果。每个阶段可附独立的 `summary`（最多 1024 字节），省略时沿用本行的顶层摘要。`code` 是可供自动化识别的原因码，使用小写字母开头，后接小写字母、数字、下划线或连字符，最长 64 个字符。原生命令退出码可以放进顶层 `data` 作为诊断信息。[可运行的适配器示例](../examples/demo-info/adapter.py)
+
+`verify`（安装验收）由 Agent 在独立的 `probe` 中核对目标版本。安装入口成功、旧进程仍在服务时，安装阶段可成功，验收显示「待激活」。Center 按主机和任务保存各阶段最近一次回执。在「安装工作流 → 运行记录」和「发布记录 → 逐机任务」都可以回看。已有安装可跳过前两阶段，用盘点结果验收。旧包可继续只返回最终结果，缺少证据的阶段显示「未上报」。升级 Center 和 Agent 后即可收集新回执。
+
 ## 从一个可安装的工具开始
 
 仓库里的 `demo-info` 是一个能运行 `--version` 的命令行工具。它把下面的 `pto-tool.json` 和 `adapter.py` 放在同一目录。打包命令的 `--dir` 指向这个目录，清单内的文件路径都相对于它。[完整示例目录](../examples/demo-info)

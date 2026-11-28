@@ -127,6 +127,28 @@ function taskBadge(t) {
   const code = t.state === 'dispatched' && t.result?.status === 'progress' ? 'progress' : t.state;
   return badge(statuses[code] || code, taskTones[code]);
 }
+function installPhaseList(phases, active) {
+  const stages = [['preflight', '环境检查'], ['install', '执行安装'], ['verify', '安装验收']];
+  const phaseLabels = {running: '执行中', 'not-run': '未执行', waiting: '等待中', unreported: '未上报', conflict: '冲突'};
+  const list = make('ol');
+  list.className = 'install-phases';
+  list.setAttribute('aria-label', '安装阶段');
+  stages.forEach(([name, title], index) => {
+    const receipt = phases?.[name];
+    const waiting = active && !stages.slice(index + 1).some(([later]) => phases?.[later]);
+    const state = receipt?.state || (waiting ? 'waiting' : 'unreported');
+    const item = make('li');
+    item.append(make('span', title), badge(phaseLabels[state] || statuses[state] || state,
+      state === 'running' ? 'active' : taskTones[state]));
+    if (receipt?.summary || receipt?.code) {
+      const reason = make('small', receipt.summary);
+      if (receipt.code) reason.append(make('code', receipt.code));
+      item.append(reason);
+    }
+    list.append(item);
+  });
+  return list;
+}
 function actionTitle(t) {
   const release = state.tools.find(v => v.digest === t.bundle);
   return labels[t.action] || release?.manifest.actions?.find(a => a.id === t.action)?.title || t.action;
@@ -311,8 +333,9 @@ function drawHistory(tasks) {
     const details = make('details');
     details.dataset.id = t.taskId;
     details.open = open.has(t.taskId);
-    details.append(make('summary', t.result?.summary || '查看详情'),
-                   make('pre', JSON.stringify(t, null, 2)));
+    details.append(make('summary', t.result?.summary || '查看详情'));
+    if (t.action === 'install') details.append(installPhaseList(t.result?.phases, ['queued', 'dispatched'].includes(t.state)));
+    details.append(make('pre', JSON.stringify(t, null, 2)));
     return [stack(t.node, t.tool), actionTitle(t), taskBadge(t), details,
             stack(t.actor, dateText(t.created))];
   }));

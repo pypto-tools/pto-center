@@ -123,6 +123,10 @@ tbody tr:last-child td { border-bottom: 0; }
 #matrix td:first-child, #matrix th:first-child { position: sticky; left: 0; z-index: 1; background: white; }
 #matrix th:first-child { background: #f8f9fb; }
 .stack { display: grid; justify-items: start; gap: .18rem; min-width: 0; }
+.install-phases { display: grid; gap: .35rem; list-style: none; padding: 0; margin: .4rem 0; }
+.install-phases li { display: grid; grid-template-columns: max-content max-content; align-items: center; gap: .1rem .65rem; font-size: .82rem; }
+.install-phases small { grid-column: 1 / -1; color: var(--secondary); overflow-wrap: anywhere; }
+.install-phases code { margin-inline-start: .4em; }
 .stack > small, .subtle { color: var(--secondary); font-size: .79rem; }
 .ident { font-family: var(--mono); font-size: .9em; overflow-wrap: anywhere; }
 .badge { display: inline-flex; align-items: center; gap: .4rem; white-space: nowrap; padding: .18rem .52rem; border-radius: 5px; font-size: .78rem; font-weight: 630; background: #edf0ee; color: #4a5b55; }

@@ -14,8 +14,11 @@ STATE = ROOT / "service.json"
 FIELDS = {"maxConcurrent", "label"}
 
 
-def report(status, summary, data=None):
-    print(json.dumps({"status": status, "summary": summary, "data": data}), flush=True)
+def report(status, summary, data=None, phases=None):
+    result = {"status": status, "summary": summary, "data": data}
+    if phases:
+        result["phases"] = phases
+    print(json.dumps(result), flush=True)
 
 
 def save(state):
@@ -51,10 +54,16 @@ def main(req):
                             writtenRevision=state.get("written", 0), effectiveRevision=state.get("active", 0))
         return report("succeeded", "盘点完成", observed)
     if op == "install" and state is None:
+        report("progress", "检查服务目录", phases={"preflight": {"state": "running"}})
+        if not os.access(ROOT, os.W_OK | os.X_OK):
+            return report("failed", "服务目录不可写",
+                          phases={"preflight": {"state": "failed", "code": "directory_not_writable"}})
+        report("progress", "服务目录可用", phases={"preflight": {"state": "succeeded"}})
+        report("progress", "正在写入服务文件", phases={"install": {"state": "running"}})
         state = {"version": req["targetVersion"], "running": req["targetVersion"],
                  "config": {"maxConcurrent": 4, "label": "local", "unmanaged": "node-local"}}
         save(state)
-        return report("succeeded", "服务已安装")
+        return report("succeeded", "服务已安装", phases={"install": {"state": "succeeded"}})
     if state is None:
         return report("skipped", "未安装")
     if op == "read-config":
